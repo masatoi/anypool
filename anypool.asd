@@ -4,7 +4,10 @@
   :license "BSD 2-Clause"
   :description "General-purpose pooling library"
   :depends-on ("bordeaux-threads"
-               "cl-speedy-queue")
+               "cl-speedy-queue"
+               #+sbcl
+               "sb-concurrency"
+               )
   :components
   ((:module "src"
     :components ((:file "main"))))

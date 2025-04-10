@@ -32,6 +32,9 @@
 (defvar *default-max-open-count* 4)
 (defvar *default-max-idle-count* 2)
 
+#+sbcl
+(defvar *cancel-mailbox* (sb-concurrency:make-mailbox :name "cancel-mailbox"))
+
 ;;
 ;; Wrap functions to support 0 length queues
 
@@ -129,24 +132,20 @@
                 (t
                  (bt:release-lock lock)
                  (unwind-protect
-                     (or #+ccl
-                         (if timeout
-                             (ccl:timed-wait-on-semaphore wait-condvar (/ timeout 1000d0))
-                             (ccl:wait-on-semaphore wait-condvar))
-                         #-ccl
-                         (bt:with-lock-held (wait-lock)
-                           (bt:condition-wait wait-condvar wait-lock :timeout (and timeout
-                                                                                   (/ timeout 1000d0))))
-                         (error 'too-many-open-connection
-                                :limit (pool-max-open-count pool)))
+                      (or #+ccl
+                          (if timeout
+                              (ccl:timed-wait-on-semaphore wait-condvar (/ timeout 1000d0))
+                              (ccl:wait-on-semaphore wait-condvar))
+                          #-ccl
+                          (bt:with-lock-held (wait-lock)
+                            (bt:condition-wait wait-condvar wait-lock :timeout (and timeout
+                                                                                    (/ timeout 1000d0))))
+                          (error 'too-many-open-connection
+                                 :limit (pool-max-open-count pool)))
                    (bt:acquire-lock lock))))
               (let ((item (dequeue storage)))
                 #+sbcl
-                (when (item-idle-timer item)
-                  ;; Release the lock once to prevent from deadlock
-                  (bt:release-lock lock)
-                  (sb-ext:unschedule-timer (item-idle-timer item))
-                  (bt:acquire-lock lock))
+                (sb-concurrency:send-message *cancel-mailbox* item)
                 (cond
                   ((item-timeout-p item)
                    (decf (pool-timeout-in-queue-count pool)))
@@ -156,7 +155,12 @@
                    (incf (pool-active-count pool))
                    (return (item-object item)))
                   ;; Not available anymore. Just ignore
-                  (t)))))))))
+                  (t)))))
+        #+sbcl
+        (loop for item = (sb-concurrency:receive-message-no-hang *cancel-mailbox*)
+              while item
+              when (item-idle-timer item)
+              do (sb-ext:unschedule-timer (item-idle-timer item)))))))
 
 #+sbcl
 (defun make-idle-timer (item timeout-fn)

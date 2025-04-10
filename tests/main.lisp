@@ -85,10 +85,10 @@
                                     (+ item (/ internal-time-units-per-second 2)))))))
     (let ((object (fetch pool)))
       (putback object pool)
-      (ok (eq (fetch pool) object))
+      (ok (= (fetch pool) object))
       (putback object pool)
-      (sleep 0.5)
-      (ng (eq (fetch pool) object)))))
+      (sleep 0.51)
+      (ng (= (fetch pool) object)))))
 
 (deftest idle-timeout
   #-sbcl (skip ":idle-timeout works only on SBCL")
@@ -120,7 +120,7 @@
                         collect (bt:make-thread
                                  (lambda ()
                                    (loop
-                                     repeat 1000
+                                     repeat 100000
                                      do (let ((object (fetch pool)))
                                           (putback object pool))))))))
     (dolist (thread threads)
