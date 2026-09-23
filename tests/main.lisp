@@ -130,6 +130,68 @@
         (ok (outputs (fetch pool) "disconnected")
             "Disconnector is called when ping fails (with idle-timeout)")))))
 
+(define-condition ping-broken (error) ())
+
+(deftest ping-error-retires-connection
+  (dolist (args (list '() #+sbcl '(:idle-timeout 600000)))
+    (testing "the connection is disconnected and the ping error propagates"
+      (let* ((disconnected '())
+             (pool (apply #'make-pool
+                          :connector (let ((n 0)) (lambda () (incf n)))
+                          :disconnector (lambda (conn) (push conn disconnected))
+                          :ping (lambda (conn)
+                                  (declare (ignore conn))
+                                  (error 'ping-broken))
+                          args))
+             (conn (fetch pool)))
+        (putback conn pool)
+        (ok (signals (fetch pool) 'ping-broken))
+        (ok (equal disconnected (list conn)) "Not left open outside the pool")
+        (ok (= (pool-open-count pool) 0))
+        (ok (= (pool-active-count pool) 0))))
+    (testing "a failing disconnector does not replace the ping error"
+      (let* ((pool (apply #'make-pool
+                          :connector (let ((n 0)) (lambda () (incf n)))
+                          :disconnector (lambda (conn) (error "disconnect ~A failed" conn))
+                          :ping (lambda (conn)
+                                  (declare (ignore conn))
+                                  (error 'ping-broken))
+                          args))
+             (conn (fetch pool)))
+        (putback conn pool)
+        (ok (signals (fetch pool) 'ping-broken))
+        (ok (= (pool-open-count pool) 0))))))
+
+#+sbcl
+(deftest ping-error-wakes-waiter
+  (let* ((pool (make-pool :name "test pool"
+                          :connector (let ((n 0)) (lambda () (incf n)))
+                          :ping (lambda (conn)
+                                  (declare (ignore conn))
+                                  (error 'ping-broken))
+                          :max-open-count 1
+                          :idle-timeout 600000
+                          :timeout 2000))
+         (in-window (bt2:make-semaphore))
+         (orig-unschedule (symbol-function 'sb-ext:unschedule-timer)))
+    (putback (fetch pool) pool)
+    ;; The fetcher holds the only slot while it unschedules the idle timer, so the
+    ;; waiter starts waiting; the ping error must then hand the slot to the waiter.
+    (let ((fetcher (bt2:make-thread
+                    (lambda ()
+                      (with-mock-functions ((sb-ext:unschedule-timer (timer)
+                                              (bt2:signal-semaphore in-window)
+                                              (sleep 0.5)
+                                              (funcall orig-unschedule timer)))
+                        (handler-case (progn (fetch pool) :no-error)
+                          (ping-broken () :ping-broken)))))))
+      (ok (bt2:wait-on-semaphore in-window :timeout 5))
+      (let ((waiter (start-waiting-fetch (lambda () (fetch pool)) (pool-lock pool))))
+        (ok (eq (bt2:join-thread fetcher) :ping-broken))
+        (let ((result (bt2:join-thread waiter)))
+          (ok (eq (first result) :ok) "The waiter is woken instead of timing out")
+          (ok (eql (second result) 2)))))))
+
 (deftest idle-timeout
   #-sbcl (skip ":idle-timeout works only on SBCL")
   #+sbcl

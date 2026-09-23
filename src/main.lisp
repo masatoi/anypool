@@ -200,7 +200,7 @@ A CONN without a creation time, i.e. not from this pool's connector, counts as e
               (pool-lifetime-limit pool))))))
 
 (defun lendable-p (pool conn)
-  "With the pool lock held, check an idle CONN before lending it; a rejected CONN is dropped.
+  "With the pool lock held, check an idle CONN before lending it; a rejected CONN is retired.
 Lifetime is checked again after PING, which may take long enough for CONN to expire."
   (let ((ping (pool-ping pool))
         (verdict nil))
@@ -210,15 +210,18 @@ Lifetime is checked again after PING, which may take long enough for CONN to exp
                      ((and ping (not (funcall ping conn))) :ping-failed)
                      ((expired-p pool conn) :expired)
                      (t :lendable)))
-      ;; Also when PING signals: CONN has already left the queue and won't come back.
+      ;; Also when PING signals, since CONN has already left the queue: the error still
+      ;; propagates, but CONN must not stay open outside the pool.
       (unless (eq verdict :lendable)
-        (forget-created-at pool conn)))
-    (or (eq verdict :lendable)
-        ;; Expired or ping failed, disconnect and continue
+        (forget-created-at pool conn)
         (let ((disconnector (pool-disconnector pool)))
           (when disconnector
-            (ignore-errors (funcall disconnector conn)))
-          nil))))
+            (ignore-errors (funcall disconnector conn))))
+        ;; A signalling PING takes the caller out of fetch, so nobody else would claim
+        ;; the freed slot. The waiter can only proceed after we release the pool lock.
+        (unless verdict
+          (notify-waiter pool))))
+    (eq verdict :lendable)))
 
 (defmacro define-fetch-impl (name pool-type &key idle-check dequeue-and-validate)
   "Generate a fetch implementation with type-specific logic."

@@ -78,7 +78,7 @@ This software is still ALPHA quality. The APIs will be likely to change.
 - `:name`: The name of a new pool. This is used to print the object.
 - `:connector` (Required): A function to make and return a new connection object. It takes no arguments.
 - `:disconnector`: A function to disconnect a given object. It takes a single argument which is made by `:connector`.
-- `:ping`: A function to check if the given object is still available. It takes a single argument.
+- `:ping`: A function to check if the given object is still available. It takes a single argument. If it returns `nil`, the object is disconnected and `fetch` tries another one. If it signals an error, the object is disconnected (any error from `:disconnector` is ignored), and then the error propagates from `fetch`.
 - `:max-open-count`: The maximum number of concurrently open connections. The default is `4` and can be configured with `*default-max-open-count*`. If `nil`, allows unlimited connections (never blocks or errors).
 - `:max-idle-count`: The maximum number of idle/pooled connections. The default is `2` and can be configured with `*default-max-idle-count*`.
 - `:timeout`: The milliseconds to wait in `fetch` when the number of open connection reached to the maximum. If `nil`, it waits forever. The default is `nil`.
@@ -151,7 +151,7 @@ Send an in-use connection back to `pool` to make it reusable by other threads. I
 
 What it guarantees:
 
-- A connection is never lent out by `fetch` once `max-lifetime` has passed since `:connector` returned it. The check is made when `fetch` commits to lending the connection, including after `:ping` returns.
+- `fetch` never lends out a connection once `max-lifetime` has passed since `:connector` returned it. An idle connection is checked when `fetch` commits to lending it, which is after `:ping` returns. A new connection is lent at age zero: `fetch` hands it out right after recording its creation time, and no callback runs in between.
 - Using a connection does not extend its lifetime. The creation time is kept across `fetch` and `putback`.
 - A connection that expires while borrowed is not touched. It is disconnected when it is `putback`, and a thread waiting in `fetch` is woken to open a new one.
 - It works with `:ping nil` and with a `:ping` that always succeeds. An expired connection is dropped without calling `:ping`.

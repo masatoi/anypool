@@ -212,6 +212,7 @@
         (install-manual-clock pool)
         (putback conn pool)
         (ok (signals (fetch pool) 'simple-error))
+        (ok (= (conn-disconnect-count conn) 1) "Retired, not left open")
         (ok (= (pool-open-count pool) 0))
         (ok (= (tracked-count pool) 0))))))
 
