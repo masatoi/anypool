@@ -4,12 +4,15 @@
         #:anypool)
   (:import-from #:anypool
                 #:pool-storage
+                #:pool-lock
                 #:dequeue-timeout-resources)
   (:import-from #:cl-speedy-queue
                 #:queue-count)
   (:import-from #:anypool/tests/utils
                 #:*mock-function*
-                #:with-mock-functions))
+                #:with-mock-functions
+                #:start-waiting-fetch))
+
 (in-package #:anypool/tests)
 
 (deftest make-pool
@@ -288,3 +291,71 @@
 
       (ok (= (pool-overflow-count pool) 0) "Still 0 after 100 fetches")
       (ok (= (pool-active-count pool) 100) "But 100 active connections"))))
+
+#+sbcl
+(deftest putback-wakes-waiter-despite-gap-before-waiting
+  (let* ((pool (make-pool :name "test pool"
+                          :connector (let ((n 0)) (lambda () (incf n)))
+                          :max-open-count 1
+                          :timeout 2000))
+         (conn (fetch pool))
+         (waiter (start-waiting-fetch (lambda () (fetch pool)) (pool-lock pool))))
+    (putback conn pool)
+    (let ((result (bt2:join-thread waiter)))
+      (ok (eq (first result) :ok) "The waiter is woken instead of timing out")
+      (ok (eql (second result) conn)))))
+
+#+sbcl
+(deftest putback-to-full-idle-queue-wakes-waiter
+  (testing "max-idle-count 0 frees the slot on every putback"
+    (let* ((pool (make-pool :name "test pool"
+                            :connector (let ((n 0)) (lambda () (incf n)))
+                            :max-open-count 1
+                            :max-idle-count 0
+                            :timeout 2000))
+           (conn (fetch pool))
+           (waiter (start-waiting-fetch (lambda () (fetch pool)) (pool-lock pool))))
+      (putback conn pool)
+      (let ((result (bt2:join-thread waiter)))
+        (ok (eq (first result) :ok))
+        (ok (eql (second result) 2) "The waiter opens a new connection"))))
+  (testing "a failing disconnector still propagates, but the waiter is woken"
+    (let* ((pool (make-pool :name "test pool"
+                            :connector (let ((n 0)) (lambda () (incf n)))
+                            :disconnector (lambda (conn)
+                                            (error "disconnect ~A failed" conn))
+                            :max-open-count 1
+                            :max-idle-count 0
+                            :timeout 2000))
+           (conn (fetch pool))
+           (waiter (start-waiting-fetch (lambda () (fetch pool)) (pool-lock pool))))
+      (ok (signals (putback conn pool) 'simple-error))
+      (let ((result (bt2:join-thread waiter)))
+        (ok (eq (first result) :ok))
+        (ok (eql (second result) 2)))
+      (ok (= (pool-active-count pool) 1)))))
+
+#+sbcl
+(deftest fetch-keeps-slot-while-unscheduling-idle-timer
+  (let* ((created 0)
+         (pool (make-pool :name "test pool"
+                          :connector (lambda () (incf created))
+                          :max-open-count 1
+                          :idle-timeout 100000
+                          :timeout 0))
+         (in-window (bt2:make-semaphore))
+         (orig-unschedule (symbol-function 'sb-ext:unschedule-timer)))
+    (putback (fetch pool) pool)
+    (let ((thread (bt2:make-thread
+                   (lambda ()
+                     (with-mock-functions ((sb-ext:unschedule-timer (timer)
+                                             (bt2:signal-semaphore in-window)
+                                             (sleep 0.3)
+                                             (funcall orig-unschedule timer)))
+                       (fetch pool))))))
+      (ok (bt2:wait-on-semaphore in-window :timeout 5))
+      (ok (signals (fetch pool) 'too-many-open-connection)
+          "The connection being checked out still occupies its slot")
+      (ok (eql (bt2:join-thread thread) 1))
+      (ok (= created 1))
+      (ok (= (pool-open-count pool) 1)))))

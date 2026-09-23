@@ -169,16 +169,20 @@
                     (error 'too-many-open-connection
                            :limit (pool-max-open-count pool)))
                    (t
-                    (bt2:release-lock lock)
                     (unwind-protect
                         (or #+ccl
-                            (if timeout
-                                (ccl:timed-wait-on-semaphore wait-condvar (/ timeout 1000d0))
-                                (ccl:wait-on-semaphore wait-condvar))
+                            (progn
+                              (bt2:release-lock lock)
+                              (if timeout
+                                  (ccl:timed-wait-on-semaphore wait-condvar (/ timeout 1000d0))
+                                  (ccl:wait-on-semaphore wait-condvar)))
                             #-ccl
+                            ;; WAIT-LOCK is taken before LOCK is released: putback notifies under
+                            ;; WAIT-LOCK, so its wakeup cannot fall between our check and the wait.
                             (bt2:with-lock-held (wait-lock)
+                              (bt2:release-lock lock)
                               (bt2:condition-wait wait-condvar wait-lock
-                                                 :timeout (and timeout (/ timeout 1000d0))))
+                                                  :timeout (and timeout (/ timeout 1000d0))))
                             (error 'too-many-open-connection
                                    :limit (pool-max-open-count pool)))
                       (bt2:acquire-lock lock))))
@@ -211,26 +215,33 @@
   :idle-check (<= (pool-idle-count pool) 0) ; Fail-safe for cases where pool-idle-count is negative
   :dequeue-and-validate
   (let ((item (dequeue storage)))
-    #+sbcl
-    (when (item-idle-timer item)
-      ;; Mark as active BEFORE releasing lock to prevent race condition
-      ;; active-p is set to true even for timed-out items or ping failures, but these items are discarded so this is harmless
-      (setf (item-active-p item) t)
-      ;; Release the lock once to prevent from deadlock
-      (bt2:release-lock lock)
-      (sb-ext:unschedule-timer (item-idle-timer item))
-      (bt2:acquire-lock lock))
-    (cond
-      ((item-timeout-p item)
-       (decf (pool-timeout-in-queue-count pool)))
-      ((or (null ping)
-           (funcall ping (item-object item)))
-       (incf (pool-active-count pool))
-       (return (item-object item)))
-      ;; Ping failed, disconnect and continue
-      (t
-       (when disconnector
-         (ignore-errors (funcall disconnector (item-object item))))))))
+    (if (item-timeout-p item)
+        (decf (pool-timeout-in-queue-count pool))
+        (let ((lent nil))
+          ;; Counted as active while LOCK is released below, or a concurrent fetch would
+          ;; see a free slot and open past max-open-count.
+          (incf (pool-active-count pool))
+          ;; The idle timer checks this under LOCK, so from here on it leaves ITEM alone.
+          (setf (item-active-p item) t)
+          (unwind-protect
+               (progn
+                 #+sbcl
+                 (when (item-idle-timer item)
+                   ;; Release the lock once to prevent from deadlock
+                   (bt2:release-lock lock)
+                   (unwind-protect (sb-ext:unschedule-timer (item-idle-timer item))
+                     (bt2:acquire-lock lock)))
+                 (setf lent
+                       (or (null ping)
+                           (funcall ping (item-object item))))
+                 ;; Ping failed, disconnect and continue
+                 (unless lent
+                   (when disconnector
+                     (ignore-errors (funcall disconnector (item-object item))))))
+            (unless lent
+              (decf (pool-active-count pool))))
+          (when lent
+            (return (item-object item)))))))
 
 (defun fetch (pool)
   "Fetch a connection from the pool."
@@ -238,28 +249,35 @@
     (pool-without-timeout (%fetch-without-timeout pool))
     (pool-with-timeout (%fetch-with-timeout pool))))
 
+(defun notify-waiter (pool)
+  (bt2:with-lock-held ((pool-wait-lock pool))
+    (bt2:condition-notify (pool-wait-condvar pool))))
+
+(defun call-then-release-slot (pool fn)
+  "Call FN, then free the slot of a lent-out connection and wake a waiter even if FN fails.
+The slot is held until FN returns so a waiter cannot open a replacement while the old one is still open."
+  (unwind-protect (funcall fn)
+    (bt2:with-lock-held ((pool-lock pool))
+      (decf (pool-active-count pool)))
+    (notify-waiter pool)))
+
 (defmacro define-putback-impl (name pool-type &key before-putback enqueue-logic)
   "Generate a putback implementation with type-specific logic."
   `(defun ,name (conn pool)
      (declare (type ,pool-type pool))
      ,@(when before-putback (list before-putback))
-     (with-slots (disconnector storage lock wait-lock wait-condvar) pool
-       (bt2:acquire-lock lock)
-       (unwind-protect
-           (if (queue-full-p storage)
-               (progn
-                 (decf (pool-active-count pool))
-                 (bt2:release-lock lock)
-                 (when disconnector
-                   (funcall disconnector conn)))
-               (progn
-                 ,enqueue-logic
-                 (decf (pool-active-count pool))
-                 (bt2:release-lock lock)
-                 (bt2:with-lock-held (wait-lock)
-                   (bt2:condition-notify wait-condvar))))
-         (bt2:release-lock lock))
-       (values))))
+     (with-slots (disconnector storage lock) pool
+       (if (bt2:with-lock-held (lock)
+             (unless (queue-full-p storage)
+               ,enqueue-logic
+               (decf (pool-active-count pool))
+               t))
+           (notify-waiter pool)
+           (call-then-release-slot pool
+                                   (lambda ()
+                                     (when disconnector
+                                       (funcall disconnector conn))))))
+     (values)))
 
 (defun dequeue-timeout-resources (pool)
   (declare (type pool-with-timeout pool))
