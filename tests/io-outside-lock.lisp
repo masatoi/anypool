@@ -74,10 +74,16 @@
 #+sbcl
 (defun await-blocked-on (thread lock)
   "Wait until THREAD is blocked taking LOCK."
-  (let ((native-thread (bt2:thread-native-thread thread))
+  ;; Looked up at run time: read as a literal, a renamed SBCL internal would stop the whole file
+  ;; from loading instead of failing only the tests that use it.
+  (let ((waiting-for (let ((symbol (find-symbol "THREAD-WAITING-FOR" "SB-THREAD")))
+                       (if (and symbol (fboundp symbol))
+                           symbol
+                           (error "SB-THREAD::THREAD-WAITING-FOR is not available in this SBCL"))))
+        (native-thread (bt2:thread-native-thread thread))
         (mutex (bt2:lock-native-lock lock)))
     (or (loop repeat 500
-              thereis (eq (sb-thread::thread-waiting-for native-thread) mutex)
+              thereis (eq (funcall waiting-for native-thread) mutex)
               do (sleep 0.01))
         (error "The thread never blocked on the lock"))))
 
@@ -585,13 +591,15 @@
     (setf rejected 1)
     (let ((fetching (spawn (lambda () (fetch pool)))))
       (await-gate gate)
-      (multiple-value-bind (finished result)
-          (call-within 2 (lambda ()
-                           (handler-case (fetch pool)
-                             (too-many-open-connection () :too-many))))
-        (ok finished)
-        (ok (eq result :too-many) "The slot is still counted while the rejected one is disconnected"))
-      (open-gate gate)
+      ;; Opened even if the competing fetch fails otherwise, or FETCHING stays parked in the gate.
+      (unwind-protect
+           (multiple-value-bind (finished result)
+               (call-within 2 (lambda ()
+                                (handler-case (fetch pool)
+                                  (too-many-open-connection () :too-many))))
+             (ok finished)
+             (ok (eq result :too-many) "The slot is still counted while the rejected one is disconnected"))
+        (open-gate gate))
       (multiple-value-bind (finished result) (join-within fetching 2)
         (ok (and finished (equal result '(:ok 2))) "The fetch opens the replacement in its slot")))
     (ok (= max-live 1) "No more physical connections than max-open-count at any time")
@@ -611,19 +619,24 @@
          (released (bt2:make-semaphore))
          (regrabbing (bt2:make-semaphore))
          (resume (bt2:make-semaphore))
+         ;; Signalled only by a wait that follows the held re-grab, so a release from a spurious
+         ;; wakeup before that cannot pass for waiting again.
+         (released-again (bt2:make-semaphore))
          (armed nil)
+         (regrabbed nil)
          (waiter nil))
     ;; The woken waiter is held before it takes the pool lock again, so a competing fetch reliably
     ;; takes the connection first.
     (with-mock-functions ((bt2:release-lock (l)
                             (prog1 (funcall orig-release l)
                               (when (and (eq l lock) (eq (bt2:current-thread) waiter))
-                                (bt2:signal-semaphore released))))
+                                (bt2:signal-semaphore (if regrabbed released-again released)))))
                           (bt2:acquire-lock (l &rest args)
                             (when (and armed (eq l lock) (eq (bt2:current-thread) waiter))
                               (setf armed nil)
                               (bt2:signal-semaphore regrabbing)
-                              (bt2:wait-on-semaphore resume :timeout 5))
+                              (bt2:wait-on-semaphore resume :timeout 5)
+                              (setf regrabbed t))
                             (apply orig-acquire l args)))
       (let ((thread (spawn (lambda ()
                              (setf waiter (bt2:current-thread))
@@ -632,10 +645,11 @@
         (setf armed t)
         (putback conn pool)
         (ok (bt2:wait-on-semaphore regrabbing :timeout 5) "The putback wakes the waiter")
-        (multiple-value-bind (finished taken) (call-within 2 (lambda () (fetch pool)))
-          (bt2:signal-semaphore resume)
+        (multiple-value-bind (finished taken)
+            (unwind-protect (call-within 2 (lambda () (fetch pool)))
+              (bt2:signal-semaphore resume))
           (ok (and finished (eql taken conn)) "A competing fetch takes the connection first")
-          (ok (bt2:wait-on-semaphore released :timeout 5) "The waiter waits again")
+          (ok (bt2:wait-on-semaphore released-again :timeout 5) "The waiter waits again")
           (ok (bt2:thread-alive-p thread) "The waiter has not returned")
           (when finished
             (putback taken pool)))
