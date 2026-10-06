@@ -192,7 +192,7 @@
     (await-gate gate)
     (await-gate gate)
     (ng (bt2:wait-on-semaphore (gate-entered gate) :timeout 0.5) "No third connect starts")
-    (open-gate gate 2)
+    (open-gate gate 4)
     (let ((results (mapcar #'bt2:join-thread threads)))
       (ok (= (count :ok results :key #'first) 2))
       (ok (every (lambda (result)
