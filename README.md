@@ -76,12 +76,12 @@ This software is still ALPHA quality. The APIs will be likely to change.
 ### [Constructor] make-pool (&key name connector disconnector ping max-open-count max-idle-count timeout idle-timeout max-lifetime)
 
 - `:name`: The name of a new pool. This is used to print the object.
-- `:connector` (Required): A function to make and return a new connection object. It takes no arguments. It runs without the pool lock and may be called from several threads at once, so it must be thread-safe.
+- `:connector` (Required): A function to make and return a new connection object. It takes no arguments. It must return a non-`nil` object. It runs without the pool lock and may be called from several threads at once, so it must be thread-safe.
 - `:disconnector`: A function to disconnect a given object. It takes a single argument which is made by `:connector`.
 - `:ping`: A function to check if the given object is still available. It takes a single argument. It runs without the pool lock and may be called from several threads at once, each on a different object. If it returns `nil`, the object is disconnected and `fetch` tries another one. If it signals an error, the object is disconnected (any error from `:disconnector` is ignored), and then the error propagates from `fetch`.
 - `:max-open-count`: The maximum number of concurrently open connections. The default is `4` and can be configured with `*default-max-open-count*`. If `nil`, allows unlimited connections (never blocks or errors).
 - `:max-idle-count`: The maximum number of idle/pooled connections. The default is `2` and can be configured with `*default-max-idle-count*`.
-- `:timeout`: The milliseconds to wait in `fetch` when the number of open connection reached to the maximum. A slot in which another `fetch` is still connecting or pinging counts as open, so this also bounds how long `fetch` waits behind a slow connect. If `nil`, it waits forever. The default is `nil`.
+- `:timeout`: The milliseconds to wait in `fetch` when the number of open connection reached to the maximum. A slot in which another `fetch` is still connecting or pinging counts as open, so this also bounds how long `fetch` waits behind a slow connect. It bounds each wait, not the whole call: if another thread takes the slot that woke `fetch`, it waits again. If `nil`, it waits forever. The default is `nil`.
 - `:idle-timeout`: The milliseconds to disconnect idle resources after they're `putback`ed to the pool. If `nil`, it won't disconnect automatically. The default is `nil`.
 - `:max-lifetime`: The milliseconds after which a connection is no longer reused, counted from when `:connector` returned it. It must be a positive real number; `0`, negative numbers and non-numbers are rejected. If `nil`, connections are reused regardless of their age. The default is `nil`. See [max-lifetime](#max-lifetime).
 
@@ -150,7 +150,8 @@ Send an in-use connection back to `pool` to make it reusable by other threads. I
 On SBCL, `fetch`, `putback` and `with-connection` keep their slot accounting correct when the thread is interrupted, for example by `sb-ext:with-timeout` or `interrupt-thread`. The connector, the ping, the disconnector and the body of `with-connection` can still be interrupted.
 
 - Use `with-connection` where you can. It defers interrupts from the moment `fetch` returns until the connection is bound, and while it is put back. If you call `fetch` and `putback` directly, an interrupt between `fetch` returning and your code taking the connection loses the connection and its slot.
-- An interrupt right after `:connector` returns, before the pool records the connection, frees the slot but leaves that physical connection open. An interrupt inside `:disconnector` can leave the connection open as well. The pool's counts stay correct in both cases.
+- If `conn` in `with-connection` names a special variable, it is bound to `nil` while `fetch` runs.
+- An interrupt right after `:connector` returns, before the pool records the connection, frees the slot but leaves that physical connection open. An interrupt while a retired connection is being disconnected can leave the connection open as well. The pool's counts stay correct in both cases.
 - On other implementations there is no protection against interrupts.
 
 ## max-lifetime
