@@ -488,7 +488,16 @@ The slot is held until FN returns so a waiter cannot open a replacement while th
 
 (defmacro with-connection ((conn pool) &body body)
   (let ((g-pool (gensym "POOL")))
-    `(let* ((,g-pool ,pool)
-            (,conn (fetch ,g-pool)))
-       (unwind-protect (progn ,@body)
-         (putback ,conn ,g-pool)))))
+    ;; Interrupts are deferred from the moment FETCH returns until CONN is bound, and while it is
+    ;; put back, so a connection cannot be dropped on the way. FETCH and PUTBACK go through
+    ;; ALLOW-WITH-INTERRUPTS* rather than WITH-LOCAL-INTERRUPTS*: entered with interrupts allowed,
+    ;; their own WITHOUT-INTERRUPTS* would deliver a pending one on exit, before CONN is bound.
+    `(let ((,g-pool ,pool)
+           (,conn nil))
+       (without-interrupts*
+         (unwind-protect
+              (progn
+                (setf ,conn (allow-with-interrupts* (fetch ,g-pool)))
+                (with-local-interrupts* ,@body))
+           (when ,conn
+             (allow-with-interrupts* (putback ,conn ,g-pool))))))))

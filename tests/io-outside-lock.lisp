@@ -293,3 +293,36 @@
           (let ((result (bt2:join-thread waiter)))
             (ok (eq (first result) :ok) "The waiter is woken")
             (ok (eql (second result) 2))))))))
+
+(deftest with-connection-returns-connection-when-body-is-interrupted
+  (let* ((gate (make-gate))
+         (pool (make-pool :connector (make-counter)))
+         (thread (spawn (lambda ()
+                          (with-connection (conn pool)
+                            (pass-gate gate)
+                            conn)))))
+    (await-gate gate)
+    (interrupt thread)
+    (multiple-value-bind (finished result) (join-within thread 2)
+      (unless finished
+        (open-gate gate))
+      (ok (and finished (interrupted-p result))))
+    (ok (= (pool-active-count pool) 0))
+    (ok (= (pool-idle-count pool) 1) "The connection is put back")))
+
+(deftest with-connection-lets-fetch-be-interrupted
+  (let* ((gate (make-gate))
+         (pool (make-pool :connector (lambda () (pass-gate gate) :conn)
+                          :max-open-count 1))
+         (thread (spawn (lambda ()
+                          (with-connection (conn pool)
+                            conn)))))
+    (await-gate gate)
+    (interrupt thread)
+    (multiple-value-bind (finished result) (join-within thread 2)
+      (unless finished
+        (open-gate gate))
+      (ok finished "The connect inside with-connection can be interrupted")
+      (ok (and finished (interrupted-p result))))
+    (ok (= (pool-active-count pool) 0))
+    (ok (= (pool-idle-count pool) 0))))
