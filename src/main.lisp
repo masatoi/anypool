@@ -241,15 +241,13 @@ to the caller. Lifetime is checked again after PING, which may take long enough 
 
 (defun disconnect-quietly (pool conn)
   "Disconnect CONN, which the pool will not lend again. Errors from the disconnector are ignored, as
-for a failed ping; an error an interrupt signals meanwhile is not, so the interrupt still takes effect."
+for a failed ping, but not one an interrupt signals with interrupts still disabled, as SBCL runs it."
   (let ((disconnector (pool-disconnector pool))
         (interruptible (interrupts-enabled-p)))
     (when disconnector
       (block disconnect
         (handler-bind ((error (lambda (e)
                                 (declare (ignore e))
-                                ;; Interrupt functions run with interrupts disabled, which is what
-                                ;; tells their errors apart from the disconnector's.
                                 (unless (and interruptible (not (interrupts-enabled-p)))
                                   (return-from disconnect nil)))))
           (funcall disconnector conn))))))

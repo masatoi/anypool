@@ -368,8 +368,8 @@
         (interrupt fetching)
         (multiple-value-bind (finished result) (join-within fetching 2)
           (unless finished
-            (open-gate gate)
-            (bt2:join-thread fetching))
+            (open-gate gate 2)
+            (ok (join-within fetching 5) "The thread finishes once the gate opens"))
           (ok finished "The disconnect in the cleanup can be interrupted")
           (ok (and finished (interrupted-p result)) "The interrupt is not ignored like a disconnect error"))
         (ok (= (pool-active-count pool) 0) "The slot is released")
@@ -399,8 +399,8 @@
       (interrupt fetching)
       (multiple-value-bind (finished result) (join-within fetching 2)
         (unless finished
-          (open-gate gate)
-          (bt2:join-thread fetching))
+          (open-gate gate 2)
+          (ok (join-within fetching 5) "The thread finishes once the gate opens"))
         (ok (and finished (interrupted-p result))
             "fetch stops instead of opening a replacement"))
       (ok (= (pool-active-count pool) 0) "The slot is released"))))
