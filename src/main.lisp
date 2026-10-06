@@ -235,14 +235,18 @@ to the caller. Lifetime is checked again after PING, which may take long enough 
          (or (null ping) (funcall ping conn))
          (not (expired-at-p pool created-at)))))
 
-(defun retire (pool conn)
-  "Disconnect CONN, which fetch has taken out and will not lend. Errors from the disconnector are
-ignored, as for a failed ping; the connection is not reused either way."
-  (bt2:with-lock-held ((pool-lock pool))
-    (forget-created-at pool conn))
+(defun disconnect-quietly (pool conn)
+  "Disconnect CONN, which fetch will not lend. Errors from the disconnector are ignored, as for a
+failed ping; the connection is not reused either way."
   (let ((disconnector (pool-disconnector pool)))
     (when disconnector
       (ignore-errors (funcall disconnector conn)))))
+
+(defun retire (pool conn)
+  "Forget and disconnect CONN, which fetch has taken out and will not lend."
+  (bt2:with-lock-held ((pool-lock pool))
+    (forget-created-at pool conn))
+  (disconnect-quietly pool conn))
 
 #+sbcl
 (defun make-idle-timer (item timeout-fn)
@@ -358,11 +362,15 @@ they work in is counted as active meanwhile, so the pool never opens more than m
                       (release-idle-timer item)
                       (when (lendable-p pool owned created-at)
                         (return))
-                      ;; Cleared first: interrupted while disconnecting, the slot is still freed
-                      ;; and the connection is not disconnected twice.
+                      ;; Ownership is dropped before disconnecting, so an interrupt while
+                      ;; disconnecting still frees the slot and does not disconnect twice. The
+                      ;; creation time goes with it: dropped alone, nothing would forget CONN.
                       (let ((conn owned))
-                        (setf owned nil)
-                        (retire pool conn)))
+                        (bt2:with-lock-held (lock)
+                          (without-interrupts*
+                            (forget-created-at pool conn)
+                            (setf owned nil)))
+                        (disconnect-quietly pool conn)))
                      (:open
                       (let ((conn (funcall (pool-connector pool))))
                         (bt2:with-lock-held (lock)
