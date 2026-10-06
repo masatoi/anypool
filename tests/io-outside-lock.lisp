@@ -3,13 +3,16 @@
         #:rove
         #:anypool)
   (:import-from #:anypool
+                #:interrupts-enabled-p
                 #:pool-clock
                 #:pool-created-at-table
                 #:pool-lock
                 #:without-interrupts*
                 #:with-local-interrupts*)
   (:import-from #:anypool/tests/utils
+                #:with-mock-functions
                 #:start-waiting-fetch))
+
 (in-package #:anypool/tests/io-outside-lock)
 
 ;;; A gate stops a callback (connector, ping, disconnector) at a known point, so a test can act on
@@ -67,6 +70,16 @@
 (defun interrupted-p (result)
   (and (eq (first result) :error)
        (typep (second result) 'interrupted)))
+
+#+sbcl
+(defun await-blocked-on (thread lock)
+  "Wait until THREAD is blocked taking LOCK."
+  (let ((native-thread (bt2:thread-native-thread thread))
+        (mutex (bt2:lock-native-lock lock)))
+    (or (loop repeat 500
+              thereis (eq (sb-thread::thread-waiting-for native-thread) mutex)
+              do (sleep 0.01))
+        (error "The thread never blocked on the lock"))))
 
 #+sbcl
 (deftest putback-interrupted-while-disconnecting-releases-slot
@@ -445,6 +458,305 @@
       (ok (and finished (interrupted-p result))))
     (ok (= (pool-active-count pool) 0))
     (ok (= (pool-idle-count pool) 0))))
+
+#+sbcl
+(deftest waiting-fetch-hands-over-the-pool-lock-with-interrupts-deferred
+  (let* ((pool (make-pool :connector (make-counter)
+                          :max-open-count 1
+                          :timeout 2000))
+         (lock (pool-lock pool))
+         (conn (fetch pool))
+         (orig-release (symbol-function 'bt2:release-lock))
+         (orig-acquire (symbol-function 'bt2:acquire-lock))
+         (record-lock (bt2:make-lock :name "record"))
+         (released (bt2:make-semaphore))
+         (waiter nil)
+         (recorded '()))
+    (flet ((record (op l)
+             (when (and (eq l lock) (eq (bt2:current-thread) waiter))
+               ;; Read before taking RECORD-LOCK, whose body re-enables interrupts where allowed.
+               (let ((enabled (interrupts-enabled-p)))
+                 (bt2:with-lock-held (record-lock)
+                   (push (cons op enabled) recorded))))))
+      (with-mock-functions ((bt2:release-lock (l)
+                              (record :release l)
+                              (prog1 (funcall orig-release l)
+                                (when (and (eq l lock) (eq (bt2:current-thread) waiter))
+                                  (bt2:signal-semaphore released))))
+                            (bt2:acquire-lock (l &rest args)
+                              (record :acquire l)
+                              (apply orig-acquire l args)))
+        (let ((thread (spawn (lambda ()
+                               (setf waiter (bt2:current-thread))
+                               (fetch pool)))))
+          (ok (bt2:wait-on-semaphore released :timeout 5) "The fetch waits for a slot")
+          (putback conn pool)
+          (multiple-value-bind (finished result) (join-within thread 3)
+            (ok (and finished (equal result (list :ok conn))) "The waiter gets the connection")))))
+    (ok (find :release recorded :key #'car))
+    (ok (find :acquire recorded :key #'car))
+    (ok (notany #'cdr recorded)
+        (format nil "The pool lock is released and taken again with interrupts deferred: ~S"
+                (reverse recorded)))))
+
+#+sbcl
+(deftest interrupted-waiter-leaves-the-pool-usable
+  (let* ((pool (make-pool :connector (make-counter)
+                          :max-open-count 1
+                          :timeout 2000))
+         (conn (fetch pool))
+         (waiter (start-waiting-fetch (lambda () (fetch pool)) (pool-lock pool))))
+    (interrupt waiter)
+    (multiple-value-bind (finished result) (join-within waiter 1)
+      (ok (and finished (interrupted-p result)) "The waiting fetch is interrupted before its timeout"))
+    (ok (= (pool-active-count pool) 1) "Only the held connection is counted")
+    (multiple-value-bind (finished result)
+        (call-within 2 (lambda ()
+                         (putback conn pool)
+                         (let ((again (fetch pool)))
+                           (putback again pool)
+                           again)))
+      (ok finished "The pool lock is not left taken")
+      (ok (eql result conn)))
+    (ok (= (pool-active-count pool) 0))
+    (ok (= (pool-idle-count pool) 1))))
+
+#+sbcl
+(deftest interrupt-while-retiring-a-rejected-connection-forgets-it
+  (let* ((pinged (bt2:make-semaphore))
+         (locked (bt2:make-semaphore))
+         (rejecting nil)
+         (disconnects (make-hash-table))
+         (pool (make-pool :connector (make-counter)
+                          :disconnector (lambda (conn) (incf (gethash conn disconnects 0)))
+                          ;; Returns only once the test holds the pool lock, so the fetch blocks
+                          ;; taking it to retire the connection.
+                          :ping (lambda (conn)
+                                  (declare (ignore conn))
+                                  (cond
+                                    (rejecting
+                                     (bt2:signal-semaphore pinged)
+                                     (bt2:wait-on-semaphore locked :timeout 5)
+                                     nil)
+                                    (t t)))
+                          :max-open-count 1
+                          :timeout 0
+                          :max-lifetime 600000))
+         (lock (pool-lock pool)))
+    (putback (fetch pool) pool)
+    (setf rejecting t)
+    (let ((fetching (spawn (lambda () (fetch pool)))))
+      (ok (bt2:wait-on-semaphore pinged :timeout 5) "The idle connection is pinged")
+      (bt2:acquire-lock lock)
+      (unwind-protect
+           (progn
+             (bt2:signal-semaphore locked)
+             (await-blocked-on fetching lock)
+             (interrupt fetching))
+        (bt2:release-lock lock))
+      (multiple-value-bind (finished result) (join-within fetching 2)
+        (ok (and finished (interrupted-p result)) "The fetch is interrupted while retiring")))
+    (ok (= (pool-active-count pool) 0) "The slot is released")
+    (ok (= (hash-table-count (pool-created-at-table pool)) (pool-open-count pool))
+        "The creation time of the retired connection is forgotten")
+    (ok (= (gethash 1 disconnects 0) 1) "The retired connection is disconnected once")))
+
+(deftest fetch-keeps-the-slot-while-disconnecting-a-rejected-connection
+  (let* ((gate (make-gate))
+         (stat-lock (bt2:make-lock :name "stats"))
+         (live 0)
+         (max-live 0)
+         (next-id (make-counter))
+         (rejected nil)
+         (pool (make-pool :connector (lambda ()
+                                       (let ((id (funcall next-id)))
+                                         (bt2:with-lock-held (stat-lock)
+                                           (setf max-live (max max-live (incf live))))
+                                         id))
+                          :disconnector (lambda (conn)
+                                          (when (eql conn rejected)
+                                            (pass-gate gate))
+                                          (bt2:with-lock-held (stat-lock)
+                                            (decf live)))
+                          :ping (lambda (conn) (not (eql conn rejected)))
+                          :max-open-count 1
+                          :timeout 0)))
+    (putback (fetch pool) pool)
+    (setf rejected 1)
+    (let ((fetching (spawn (lambda () (fetch pool)))))
+      (await-gate gate)
+      (multiple-value-bind (finished result)
+          (call-within 2 (lambda ()
+                           (handler-case (fetch pool)
+                             (too-many-open-connection () :too-many))))
+        (ok finished)
+        (ok (eq result :too-many) "The slot is still counted while the rejected one is disconnected"))
+      (open-gate gate)
+      (multiple-value-bind (finished result) (join-within fetching 2)
+        (ok (and finished (equal result '(:ok 2))) "The fetch opens the replacement in its slot")))
+    (ok (= max-live 1) "No more physical connections than max-open-count at any time")
+    (ok (= live 1))
+    (ok (= (pool-active-count pool) 1))
+    (ok (= (pool-idle-count pool) 0))))
+
+#+sbcl
+(deftest woken-waiter-that-loses-the-race-waits-again
+  (let* ((pool (make-pool :connector (make-counter)
+                          :max-open-count 1
+                          :timeout 2000))
+         (lock (pool-lock pool))
+         (conn (fetch pool))
+         (orig-release (symbol-function 'bt2:release-lock))
+         (orig-acquire (symbol-function 'bt2:acquire-lock))
+         (released (bt2:make-semaphore))
+         (regrabbing (bt2:make-semaphore))
+         (resume (bt2:make-semaphore))
+         (armed nil)
+         (waiter nil))
+    ;; The woken waiter is held before it takes the pool lock again, so a competing fetch reliably
+    ;; takes the connection first.
+    (with-mock-functions ((bt2:release-lock (l)
+                            (prog1 (funcall orig-release l)
+                              (when (and (eq l lock) (eq (bt2:current-thread) waiter))
+                                (bt2:signal-semaphore released))))
+                          (bt2:acquire-lock (l &rest args)
+                            (when (and armed (eq l lock) (eq (bt2:current-thread) waiter))
+                              (setf armed nil)
+                              (bt2:signal-semaphore regrabbing)
+                              (bt2:wait-on-semaphore resume :timeout 5))
+                            (apply orig-acquire l args)))
+      (let ((thread (spawn (lambda ()
+                             (setf waiter (bt2:current-thread))
+                             (fetch pool)))))
+        (ok (bt2:wait-on-semaphore released :timeout 5) "The fetch waits for a slot")
+        (setf armed t)
+        (putback conn pool)
+        (ok (bt2:wait-on-semaphore regrabbing :timeout 5) "The putback wakes the waiter")
+        (multiple-value-bind (finished taken) (call-within 2 (lambda () (fetch pool)))
+          (bt2:signal-semaphore resume)
+          (ok (and finished (eql taken conn)) "A competing fetch takes the connection first")
+          (ok (bt2:wait-on-semaphore released :timeout 5) "The waiter waits again")
+          (ok (bt2:thread-alive-p thread) "The waiter has not returned")
+          (when finished
+            (putback taken pool)))
+        (multiple-value-bind (finished result) (join-within thread 3)
+          (ok (and finished (equal result (list :ok conn)))
+              "The waiter gets the connection once it is put back again"))))
+    (ok (= (pool-active-count pool) 1) "No connection is opened beyond max-open-count")))
+
+(deftest rejected-idle-connections-share-one-slot
+  (dolist (args (list '() #+sbcl '(:idle-timeout 600000)))
+    (let* ((disconnected '())
+           (rejecting nil)
+           (pool (apply #'make-pool
+                        :connector (make-counter)
+                        :disconnector (lambda (conn) (push conn disconnected))
+                        :ping (lambda (conn)
+                                (declare (ignore conn))
+                                (not rejecting))
+                        :max-open-count 3
+                        :max-idle-count 3
+                        :timeout 0
+                        args)))
+      (let ((conns (list (fetch pool) (fetch pool) (fetch pool))))
+        (dolist (conn conns)
+          (putback conn pool)))
+      (setf rejecting t)
+      (ok (eql (fetch pool) 4) "One new connection replaces all rejected ones")
+      (ok (equal (sort disconnected #'<) '(1 2 3)) "Each rejected connection is disconnected once")
+      (ok (= (pool-active-count pool) 1))
+      (ok (= (pool-idle-count pool) 0))
+      (ok (= (pool-open-count pool) 1)))))
+
+#+sbcl
+(deftest interrupt-right-after-connect-leaks-only-the-connection
+  (let* ((connected (bt2:make-semaphore))
+         (locked (bt2:make-semaphore))
+         (disconnected '())
+         (conn (list :conn))
+         ;; Returns only once the test holds the pool lock, so the fetch blocks taking it to
+         ;; record the creation time.
+         (pool (make-pool :connector (lambda ()
+                                       (bt2:signal-semaphore connected)
+                                       (bt2:wait-on-semaphore locked :timeout 5)
+                                       conn)
+                          :disconnector (lambda (c) (push c disconnected))
+                          :max-open-count 1
+                          :timeout 0
+                          :max-lifetime 600000))
+         (lock (pool-lock pool))
+         (fetching (spawn (lambda () (fetch pool)))))
+    (ok (bt2:wait-on-semaphore connected :timeout 5) "The connector runs")
+    (bt2:acquire-lock lock)
+    (unwind-protect
+         (progn
+           (bt2:signal-semaphore locked)
+           (await-blocked-on fetching lock)
+           (interrupt fetching))
+      (bt2:release-lock lock))
+    (multiple-value-bind (finished result) (join-within fetching 2)
+      (ok (and finished (interrupted-p result)) "The fetch is interrupted before taking the connection"))
+    (ok (= (pool-active-count pool) 0) "The slot is released")
+    (ok (= (hash-table-count (pool-created-at-table pool)) (pool-open-count pool) 0)
+        "No creation time is left for the connection")
+    (ok (null disconnected) "The physical connection leaks, as documented")))
+
+(deftest with-connection-puts-back-on-non-local-exit
+  (let ((pool (make-pool :connector (make-counter))))
+    (ok (eql (block body
+               (with-connection (conn pool)
+                 (return-from body conn)))
+             1))
+    (ok (= (pool-active-count pool) 0))
+    (ok (= (pool-idle-count pool) 1) "The connection is put back")))
+
+(deftest with-connection-returns-all-values-of-the-body
+  (let ((pool (make-pool :connector (make-counter))))
+    (ok (equal (multiple-value-list (with-connection (conn pool)
+                                      (values conn :b :c)))
+               '(1 :b :c)))))
+
+(defvar *conn* :outer)
+
+(defun current-conn ()
+  *conn*)
+
+(deftest with-connection-binds-a-special-variable
+  (let ((pool (make-pool :connector (make-counter))))
+    (ok (eql (with-connection (*conn* pool)
+               (current-conn))
+             1)
+        "The body sees the fetched connection through the dynamic binding")
+    (ok (eq *conn* :outer) "The outer value is restored")))
+
+#+sbcl
+(deftest with-connection-keeps-the-callers-interrupt-state
+  (let ((pool (make-pool :connector (make-counter))))
+    (ok (eq (with-connection (conn pool)
+              (interrupts-enabled-p))
+            t)
+        "Enabled in the body for a normal caller")
+    (ok (null (without-interrupts*
+                (with-connection (conn pool)
+                  (interrupts-enabled-p))))
+        "Still deferred in the body for a caller that deferred them")))
+
+(deftest with-connection-ignores-a-disconnect-error-for-an-expired-connection
+  (let* ((pool (make-pool :connector (make-counter)
+                          :disconnector (lambda (conn)
+                                          (declare (ignore conn))
+                                          (error "disconnect failed"))
+                          :max-lifetime 1000))
+         (now 0))
+    (setf (pool-clock pool) (lambda () now))
+    (ok (eq (with-connection (conn pool)
+              (setf now (* 5 internal-time-units-per-second))
+              :done)
+            :done)
+        "The body's value is returned")
+    (ok (= (pool-active-count pool) 0) "The slot is freed")
+    (ok (= (pool-open-count pool) 0))
+    (ok (= (hash-table-count (pool-created-at-table pool)) 0))))
 
 (define-condition injected-failure (error) ())
 
