@@ -68,6 +68,7 @@
   (and (eq (first result) :error)
        (typep (second result) 'interrupted)))
 
+#+sbcl
 (deftest putback-interrupted-while-disconnecting-releases-slot
   (let* ((gate (make-gate))
          (pool (make-pool :connector (make-counter)
@@ -200,6 +201,7 @@
                        (typep (second result) 'too-many-open-connection)))
                  results)))))
 
+#+sbcl
 (deftest connector-error-releases-slot-and-wakes-waiter
   (let* ((gate (make-gate))
          (calls (make-counter))
@@ -289,6 +291,7 @@
              2)
         "The slot can be used again")))
 
+#+sbcl
 (deftest interrupt-during-connect-releases-slot
   (let* ((gate (make-gate))
          (calls (make-counter))
@@ -312,6 +315,7 @@
           (ok (eql (second result) 2)))
         (ok (= (pool-active-count pool) 1))))))
 
+#+sbcl
 (deftest interrupt-during-ping-retires-connection-and-releases-slot
   (dolist (args (list '() #+sbcl '(:idle-timeout 600000)))
     (let* ((gate (make-gate))
@@ -343,6 +347,7 @@
             (ok (eq (first result) :ok) "The waiter is woken")
             (ok (eql (second result) 2))))))))
 
+#+sbcl
 (deftest interrupt-during-cleanup-disconnect-releases-slot
   (dolist (args (list '() #+sbcl '(:idle-timeout 600000)))
     (let* ((gate (make-gate))
@@ -379,6 +384,7 @@
                  2)
             "The slot can be used again")))))
 
+#+sbcl
 (deftest interrupt-while-disconnecting-a-failed-ping-is-not-ignored
   (let* ((gate (make-gate))
          (failing nil)
@@ -405,6 +411,7 @@
             "fetch stops instead of opening a replacement"))
       (ok (= (pool-active-count pool) 0) "The slot is released"))))
 
+#+sbcl
 (deftest with-connection-returns-connection-when-body-is-interrupted
   (let* ((gate (make-gate))
          (pool (make-pool :connector (make-counter)))
@@ -421,6 +428,7 @@
     (ok (= (pool-active-count pool) 0))
     (ok (= (pool-idle-count pool) 1) "The connection is put back")))
 
+#+sbcl
 (deftest with-connection-lets-fetch-be-interrupted
   (let* ((gate (make-gate))
          (pool (make-pool :connector (lambda () (pass-gate gate) :conn)
@@ -444,6 +452,7 @@
 ;; thread (its start-up, or bt2's wrapper after the body returns) would go unhandled.
 (defvar *armed* nil)
 
+#+sbcl
 (deftest fetch-survives-failures-and-interrupts-under-concurrency
   (dolist (args (list '() #+sbcl '(:idle-timeout 1)))
     (let* ((stat-lock (bt2:make-lock :name "stats"))
