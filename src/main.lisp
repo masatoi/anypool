@@ -283,33 +283,29 @@ queue item, or NIL when none is left. A dequeued item is marked active so its id
 
 (defun wait-for-slot (pool)
   "With the pool lock held, wait until a slot may have been freed; the lock is held again on return.
-Signal TOO-MANY-OPEN-CONNECTION when TIMEOUT runs out."
+Return NIL when TIMEOUT runs out, so the caller can signal after releasing the lock."
   (with-slots (lock timeout wait-lock wait-condvar) pool
-    (when (and (numberp timeout)
-               (zerop timeout))
-      (error 'too-many-open-connection
-             :limit (pool-max-open-count pool)))
-    ;; SBCL's mutex release and grab are not interrupt-safe: interrupted halfway, LOCK is left taken
-    ;; by no thread and every later fetch hangs. Interrupts are allowed only while sleeping.
-    (unless (without-interrupts*
-              (unwind-protect
-                   #+ccl
-                   (progn
-                     (bt2:release-lock lock)
-                     (if timeout
-                         (ccl:timed-wait-on-semaphore wait-condvar (/ timeout 1000d0))
-                         (ccl:wait-on-semaphore wait-condvar)))
-                   #-ccl
-                   ;; WAIT-LOCK is taken before LOCK is released: putback notifies under
-                   ;; WAIT-LOCK, so its wakeup cannot fall between our check and the wait.
-                   (bt2:with-lock-held (wait-lock)
-                     (bt2:release-lock lock)
-                     (allow-with-interrupts*
-                       (bt2:condition-wait wait-condvar wait-lock
-                                           :timeout (and timeout (/ timeout 1000d0)))))
-                (allow-with-interrupts* (bt2:acquire-lock lock))))
-      (error 'too-many-open-connection
-             :limit (pool-max-open-count pool)))))
+    (unless (and (numberp timeout)
+                 (zerop timeout))
+      ;; SBCL's mutex release and grab are not interrupt-safe: interrupted halfway, LOCK is left
+      ;; taken by no thread and every later fetch hangs. Interrupts are allowed only while sleeping.
+      (without-interrupts*
+        (unwind-protect
+             #+ccl
+             (progn
+               (bt2:release-lock lock)
+               (if timeout
+                   (ccl:timed-wait-on-semaphore wait-condvar (/ timeout 1000d0))
+                   (ccl:wait-on-semaphore wait-condvar)))
+             #-ccl
+             ;; WAIT-LOCK is taken before LOCK is released: putback notifies under
+             ;; WAIT-LOCK, so its wakeup cannot fall between our check and the wait.
+             (bt2:with-lock-held (wait-lock)
+               (bt2:release-lock lock)
+               (allow-with-interrupts*
+                 (bt2:condition-wait wait-condvar wait-lock
+                                     :timeout (and timeout (/ timeout 1000d0)))))
+          (allow-with-interrupts* (bt2:acquire-lock lock)))))))
 
 (defun release-idle-timer (item)
   "Stop the idle timer of ITEM, which fetch has taken out. Called without the pool lock, which the
@@ -360,7 +356,13 @@ they work in is counted as active meanwhile, so the pool never opens more than m
                               (setf action :open)))))
                        (when action
                          (return))
-                       (wait-for-slot pool)))
+                       (unless (wait-for-slot pool)
+                         (return))))
+                   ;; Signalled outside the lock: handlers may do I/O, and every fetch and putback
+                   ;; would wait for them.
+                   (unless action
+                     (error 'too-many-open-connection
+                            :limit (pool-max-open-count pool)))
                    (ecase action
                      (:check
                       (release-idle-timer item)

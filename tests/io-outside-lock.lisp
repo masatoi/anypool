@@ -153,6 +153,33 @@
       (open-gate gate)
       (ok (equal (bt2:join-thread connecting) '(:ok :conn))))))
 
+(deftest too-many-open-connection-is-signalled-without-the-pool-lock
+  (dolist (timeout '(50 0))
+    (let* ((pool (make-pool :connector (make-counter)
+                            :max-open-count 1
+                            :timeout timeout))
+           (lock (pool-lock pool))
+           (handled nil)
+           (lock-free nil))
+      (fetch pool)
+      (multiple-value-bind (finished result)
+          (call-within 5 (lambda ()
+                           (handler-case
+                               (handler-bind ((too-many-open-connection
+                                                (lambda (c)
+                                                  (declare (ignore c))
+                                                  (setf handled t)
+                                                  (when (ignore-errors (bt2:acquire-lock lock :wait nil))
+                                                    (bt2:release-lock lock)
+                                                    (setf lock-free t)))))
+                                 (fetch pool))
+                             (too-many-open-connection () :too-many))))
+        (ok finished)
+        (ok (eq result :too-many))
+        (ok handled)
+        (ok lock-free (format nil "The pool lock is free in the handler (timeout ~A)" timeout)))
+      (ok (= (pool-active-count pool) 1)))))
+
 (deftest connects-in-flight-count-toward-max-open
   (let* ((gate (make-gate))
          (next-id (make-counter))
