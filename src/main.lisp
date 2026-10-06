@@ -33,6 +33,25 @@
 (defvar *default-max-open-count* 4)
 (defvar *default-max-idle-count* 2)
 
+;;; SB-EXT:WITH-TIMEOUT and INTERRUPT-THREAD can unwind a thread between any two forms. Slot
+;;; accounting runs with them deferred so a slot is never lost or freed twice. Only SBCL is
+;;; protected; elsewhere these are PROGN.
+
+(defmacro without-interrupts* (&body body)
+  #+sbcl `(sb-sys:without-interrupts ,@body)
+  #-sbcl `(progn ,@body))
+
+(defmacro with-local-interrupts* (&body body)
+  "Allow interrupts in BODY again. Must appear lexically inside WITHOUT-INTERRUPTS*."
+  #+sbcl `(sb-sys:with-local-interrupts ,@body)
+  #-sbcl `(progn ,@body))
+
+(defmacro allow-with-interrupts* (&body body)
+  "Keep interrupts deferred in BODY, but let a WITH-LOCAL-INTERRUPTS* further in allow them.
+Must appear lexically inside WITHOUT-INTERRUPTS*."
+  #+sbcl `(sb-sys:allow-with-interrupts ,@body)
+  #-sbcl `(progn ,@body))
+
 (defun make-queue* (size)
   (if (zerop size)
       (make-array 2 :initial-contents '(2 2))
@@ -322,45 +341,55 @@ Lifetime is checked again after PING, which may take long enough for CONN to exp
   (bt2:with-lock-held ((pool-wait-lock pool))
     (bt2:condition-notify (pool-wait-condvar pool))))
 
+(defun release-slot (pool)
+  "Free one slot counted in ACTIVE-COUNT and wake a waiter to claim it."
+  (without-interrupts*
+    (bt2:with-lock-held ((pool-lock pool))
+      (decf (pool-active-count pool)))
+    (notify-waiter pool)))
+
 (defun call-then-release-slot (pool fn)
   "Call FN, then free the slot of a lent-out connection and wake a waiter even if FN fails.
 The slot is held until FN returns so a waiter cannot open a replacement while the old one is still open."
   (unwind-protect (funcall fn)
-    (bt2:with-lock-held ((pool-lock pool))
-      (decf (pool-active-count pool)))
-    (notify-waiter pool)))
+    (release-slot pool)))
 
 (defmacro define-putback-impl (name pool-type &key before-putback enqueue-logic)
   "Generate a putback implementation with type-specific logic."
   `(defun ,name (conn pool)
      (declare (type ,pool-type pool))
-     ,@(when before-putback (list before-putback))
-     (with-slots (disconnector storage lock) pool
-       (ecase (bt2:with-lock-held (lock)
-                (cond
-                  ((expired-p pool conn)
-                   (forget-created-at pool conn)
-                   :expired)
-                  ((queue-full-p storage)
-                   (forget-created-at pool conn)
-                   :full)
-                  (t
-                   ,enqueue-logic
-                   (decf (pool-active-count pool))
-                   :enqueued)))
-         (:enqueued
-          (notify-waiter pool))
-         (:expired
-          ;; Errors are ignored as for a failed ping; the connection is gone either way.
-          (call-then-release-slot pool
-                                  (lambda ()
-                                    (when disconnector
-                                      (ignore-errors (funcall disconnector conn))))))
-         (:full
-          (call-then-release-slot pool
-                                  (lambda ()
-                                    (when disconnector
-                                      (funcall disconnector conn)))))))
+     ;; Interrupted between the decision and its outcome, CONN would be neither queued nor its
+     ;; slot freed. Only the disconnect, which does I/O, can be interrupted.
+     (without-interrupts*
+       ,@(when before-putback (list before-putback))
+       (with-slots (disconnector storage lock) pool
+         (ecase (bt2:with-lock-held (lock)
+                  (cond
+                    ((expired-p pool conn)
+                     (forget-created-at pool conn)
+                     :expired)
+                    ((queue-full-p storage)
+                     (forget-created-at pool conn)
+                     :full)
+                    (t
+                     ,enqueue-logic
+                     (decf (pool-active-count pool))
+                     :enqueued)))
+           (:enqueued
+            (notify-waiter pool))
+           (:expired
+            ;; Errors are ignored as for a failed ping; the connection is gone either way.
+            (call-then-release-slot pool
+                                    (lambda ()
+                                      (with-local-interrupts*
+                                        (when disconnector
+                                          (ignore-errors (funcall disconnector conn)))))))
+           (:full
+            (call-then-release-slot pool
+                                    (lambda ()
+                                      (with-local-interrupts*
+                                        (when disconnector
+                                          (funcall disconnector conn)))))))))
      (values)))
 
 (defun dequeue-timeout-resources (pool)
