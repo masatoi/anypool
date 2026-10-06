@@ -289,23 +289,27 @@ Signal TOO-MANY-OPEN-CONNECTION when TIMEOUT runs out."
                (zerop timeout))
       (error 'too-many-open-connection
              :limit (pool-max-open-count pool)))
-    (unwind-protect
-         (or #+ccl
-             (progn
-               (bt2:release-lock lock)
-               (if timeout
-                   (ccl:timed-wait-on-semaphore wait-condvar (/ timeout 1000d0))
-                   (ccl:wait-on-semaphore wait-condvar)))
-             #-ccl
-             ;; WAIT-LOCK is taken before LOCK is released: putback notifies under
-             ;; WAIT-LOCK, so its wakeup cannot fall between our check and the wait.
-             (bt2:with-lock-held (wait-lock)
-               (bt2:release-lock lock)
-               (bt2:condition-wait wait-condvar wait-lock
-                                   :timeout (and timeout (/ timeout 1000d0))))
-             (error 'too-many-open-connection
-                    :limit (pool-max-open-count pool)))
-      (bt2:acquire-lock lock))))
+    ;; SBCL's mutex release and grab are not interrupt-safe: interrupted halfway, LOCK is left taken
+    ;; by no thread and every later fetch hangs. Interrupts are allowed only while sleeping.
+    (unless (without-interrupts*
+              (unwind-protect
+                   #+ccl
+                   (progn
+                     (bt2:release-lock lock)
+                     (if timeout
+                         (ccl:timed-wait-on-semaphore wait-condvar (/ timeout 1000d0))
+                         (ccl:wait-on-semaphore wait-condvar)))
+                   #-ccl
+                   ;; WAIT-LOCK is taken before LOCK is released: putback notifies under
+                   ;; WAIT-LOCK, so its wakeup cannot fall between our check and the wait.
+                   (bt2:with-lock-held (wait-lock)
+                     (bt2:release-lock lock)
+                     (allow-with-interrupts*
+                       (bt2:condition-wait wait-condvar wait-lock
+                                           :timeout (and timeout (/ timeout 1000d0)))))
+                (allow-with-interrupts* (bt2:acquire-lock lock))))
+      (error 'too-many-open-connection
+             :limit (pool-max-open-count pool)))))
 
 (defun release-idle-timer (item)
   "Stop the idle timer of ITEM, which fetch has taken out. Called without the pool lock, which the
