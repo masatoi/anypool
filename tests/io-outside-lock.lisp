@@ -267,6 +267,28 @@
     (ok (= (pool-active-count pool) 0))
     (ok (eq (fetch pool) :conn) "The slot is free again")))
 
+(deftest non-local-exit-from-disconnector-in-cleanup-releases-slot
+  (let* ((pool (make-pool :connector (make-counter)
+                          :disconnector (lambda (conn)
+                                          (declare (ignore conn))
+                                          (throw 'disconnecting :thrown))
+                          :ping (lambda (conn)
+                                  (declare (ignore conn))
+                                  (error "ping failed"))
+                          :max-open-count 1
+                          :timeout 0)))
+    (putback (fetch pool) pool)
+    (ok (eq (catch 'disconnecting
+              (handler-case (fetch pool)
+                (error () :ping-error)))
+            :thrown)
+        "The cleanup retires the connection being pinged")
+    (ok (= (pool-active-count pool) 0) "The slot is released")
+    (ok (eql (handler-case (fetch pool)
+               (too-many-open-connection () :too-many))
+             2)
+        "The slot can be used again")))
+
 (deftest interrupt-during-connect-releases-slot
   (let* ((gate (make-gate))
          (calls (make-counter))

@@ -392,10 +392,11 @@ they work in is counted as active meanwhile, so the pool never opens more than m
              (setf lent owned
                    owned nil))
         (unless lent
-          (when owned
-            (retire pool owned))
-          (when held
-            (release-slot pool)))))
+          ;; The disconnector may exit non-locally; the slot is freed regardless.
+          (unwind-protect (when owned
+                            (retire pool owned))
+            (when held
+              (release-slot pool))))))
     lent))
 
 (defun notify-waiter (pool)
