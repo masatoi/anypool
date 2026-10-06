@@ -343,6 +343,68 @@
             (ok (eq (first result) :ok) "The waiter is woken")
             (ok (eql (second result) 2))))))))
 
+(deftest interrupt-during-cleanup-disconnect-releases-slot
+  (dolist (args (list '() #+sbcl '(:idle-timeout 600000)))
+    (let* ((gate (make-gate))
+           (failing nil)
+           (pool (apply #'make-pool
+                        :connector (make-counter)
+                        :disconnector (lambda (conn)
+                                        (declare (ignore conn))
+                                        (when failing
+                                          (pass-gate gate)))
+                        :ping (lambda (conn)
+                                (declare (ignore conn))
+                                (when failing
+                                  (error "ping failed"))
+                                t)
+                        :max-open-count 1
+                        :timeout 0
+                        args)))
+      (putback (fetch pool) pool)
+      (setf failing t)
+      (let ((fetching (spawn (lambda () (fetch pool)))))
+        (await-gate gate)
+        (interrupt fetching)
+        (multiple-value-bind (finished result) (join-within fetching 2)
+          (unless finished
+            (open-gate gate)
+            (bt2:join-thread fetching))
+          (ok finished "The disconnect in the cleanup can be interrupted")
+          (ok (and finished (interrupted-p result)) "The interrupt is not ignored like a disconnect error"))
+        (ok (= (pool-active-count pool) 0) "The slot is released")
+        (setf failing nil)
+        (ok (eql (handler-case (fetch pool)
+                   (too-many-open-connection () :too-many))
+                 2)
+            "The slot can be used again")))))
+
+(deftest interrupt-while-disconnecting-a-failed-ping-is-not-ignored
+  (let* ((gate (make-gate))
+         (failing nil)
+         (pool (make-pool :connector (make-counter)
+                          :disconnector (lambda (conn)
+                                          (declare (ignore conn))
+                                          (when failing
+                                            (pass-gate gate)))
+                          :ping (lambda (conn)
+                                  (declare (ignore conn))
+                                  (not failing))
+                          :max-open-count 1
+                          :timeout 0)))
+    (putback (fetch pool) pool)
+    (setf failing t)
+    (let ((fetching (spawn (lambda () (fetch pool)))))
+      (await-gate gate)
+      (interrupt fetching)
+      (multiple-value-bind (finished result) (join-within fetching 2)
+        (unless finished
+          (open-gate gate)
+          (bt2:join-thread fetching))
+        (ok (and finished (interrupted-p result))
+            "fetch stops instead of opening a replacement"))
+      (ok (= (pool-active-count pool) 0) "The slot is released"))))
+
 (deftest with-connection-returns-connection-when-body-is-interrupted
   (let* ((gate (make-gate))
          (pool (make-pool :connector (make-counter)))

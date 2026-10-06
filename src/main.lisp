@@ -52,6 +52,10 @@ Must appear lexically inside WITHOUT-INTERRUPTS*."
   #+sbcl `(sb-sys:allow-with-interrupts ,@body)
   #-sbcl `(progn ,@body))
 
+(defun interrupts-enabled-p ()
+  #+sbcl sb-sys:*interrupts-enabled*
+  #-sbcl t)
+
 (defun make-queue* (size)
   (if (zerop size)
       (make-array 2 :initial-contents '(2 2))
@@ -236,17 +240,19 @@ to the caller. Lifetime is checked again after PING, which may take long enough 
          (not (expired-at-p pool created-at)))))
 
 (defun disconnect-quietly (pool conn)
-  "Disconnect CONN, which fetch will not lend. Errors from the disconnector are ignored, as for a
-failed ping; the connection is not reused either way."
-  (let ((disconnector (pool-disconnector pool)))
+  "Disconnect CONN, which the pool will not lend again. Errors from the disconnector are ignored, as
+for a failed ping; an error an interrupt signals meanwhile is not, so the interrupt still takes effect."
+  (let ((disconnector (pool-disconnector pool))
+        (interruptible (interrupts-enabled-p)))
     (when disconnector
-      (ignore-errors (funcall disconnector conn)))))
-
-(defun retire (pool conn)
-  "Forget and disconnect CONN, which fetch has taken out and will not lend."
-  (bt2:with-lock-held ((pool-lock pool))
-    (forget-created-at pool conn))
-  (disconnect-quietly pool conn))
+      (block disconnect
+        (handler-bind ((error (lambda (e)
+                                (declare (ignore e))
+                                ;; Interrupt functions run with interrupts disabled, which is what
+                                ;; tells their errors apart from the disconnector's.
+                                (unless (and interruptible (not (interrupts-enabled-p)))
+                                  (return-from disconnect nil)))))
+          (funcall disconnector conn))))))
 
 #+sbcl
 (defun make-idle-timer (item timeout-fn)
@@ -391,9 +397,15 @@ they work in is counted as active meanwhile, so the pool never opens more than m
              (setf lent owned
                    owned nil))
         (unless lent
-          ;; The disconnector may exit non-locally; the slot is freed regardless.
-          (unwind-protect (when owned
-                            (retire pool owned))
+          ;; The disconnector may exit non-locally; the slot is freed regardless. Interrupts are
+          ;; allowed only in the disconnect, which can block and must stay cancellable.
+          (unwind-protect
+               (when owned
+                 (let ((conn owned))
+                   (bt2:with-lock-held (lock)
+                     (setf owned nil)
+                     (forget-created-at pool conn))
+                   (with-local-interrupts* (disconnect-quietly pool conn))))
             (when held
               (release-slot pool))))))
     lent))
@@ -443,8 +455,7 @@ The slot is held until FN returns so a waiter cannot open a replacement while th
             (call-then-release-slot pool
                                     (lambda ()
                                       (with-local-interrupts*
-                                        (when disconnector
-                                          (ignore-errors (funcall disconnector conn)))))))
+                                        (disconnect-quietly pool conn)))))
            (:full
             (call-then-release-slot pool
                                     (lambda ()
