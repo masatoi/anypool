@@ -368,9 +368,8 @@ they work in is counted as active meanwhile, so the pool never opens more than m
                       (release-idle-timer item)
                       (when (lendable-p pool owned created-at)
                         (return))
-                      ;; Ownership is dropped before disconnecting, so an interrupt while
-                      ;; disconnecting still frees the slot and does not disconnect twice. The
-                      ;; creation time goes with it: dropped alone, nothing would forget CONN.
+                      ;; Ownership and the creation time are dropped together before disconnecting,
+                      ;; so an interrupt there frees the slot without a second disconnect.
                       (let ((conn owned))
                         (bt2:with-lock-held (lock)
                           (without-interrupts*
@@ -387,8 +386,8 @@ they work in is counted as active meanwhile, so the pool never opens more than m
                               (register-created-at pool conn))
                             (setf owned conn))))
                       (return))))))
-             ;; Interrupts are deferred here, so the connection cannot be lost between the loop
-             ;; and the caller.
+             ;; The connection is safe from interrupts until FETCH returns; past that the caller
+             ;; must defer them, as WITH-CONNECTION does.
              (setf lent owned
                    owned nil))
         (unless lent
@@ -503,10 +502,8 @@ The slot is held until FN returns so a waiter cannot open a replacement while th
 
 (defmacro with-connection ((conn pool) &body body)
   (let ((g-pool (gensym "POOL")))
-    ;; Interrupts are deferred from the moment FETCH returns until CONN is bound, and while it is
-    ;; put back, so a connection cannot be dropped on the way. FETCH and PUTBACK go through
-    ;; ALLOW-WITH-INTERRUPTS* rather than WITH-LOCAL-INTERRUPTS*: entered with interrupts allowed,
-    ;; their own WITHOUT-INTERRUPTS* would deliver a pending one on exit, before CONN is bound.
+    ;; FETCH/PUTBACK go through ALLOW-WITH-INTERRUPTS*, not WITH-LOCAL-INTERRUPTS*: their own
+    ;; WITHOUT-INTERRUPTS* would otherwise deliver a pending interrupt before CONN is bound.
     `(let ((,g-pool ,pool)
            (,conn nil))
        (without-interrupts*
