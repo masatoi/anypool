@@ -376,6 +376,12 @@
     (ok (= (pool-active-count pool) 0))
     (ok (= (pool-idle-count pool) 0))))
 
+(define-condition injected-failure (error) ())
+
+;; Bound to T only where the worker catches INTERRUPTED; an interrupt landing anywhere else in the
+;; thread (its start-up, or bt2's wrapper after the body returns) would go unhandled.
+(defvar *armed* nil)
+
 (deftest fetch-survives-failures-and-interrupts-under-concurrency
   (dolist (args (list '() #+sbcl '(:idle-timeout 1)))
     (let* ((stat-lock (bt2:make-lock :name "stats"))
@@ -383,15 +389,17 @@
            (double-disconnects 0)
            (double-lends 0)
            (negative-counts 0)
+           (unexpected-errors '())
            (lent (make-hash-table :test 'eq))
            (next-id (make-counter))
            (clock-lock (bt2:make-lock :name "clock"))
            (now 0)
            (interrupts 0)
+           (stop nil)
            (pool (apply #'make-pool
                         :connector (lambda ()
                                      (when (zerop (random 20))
-                                       (error "connect failed"))
+                                       (error 'injected-failure))
                                      ;; (id . disconnect-count)
                                      (let ((conn (cons (funcall next-id) 0)))
                                        (bt2:with-lock-held (stat-lock)
@@ -405,7 +413,7 @@
                         :ping (lambda (conn)
                                 (declare (ignore conn))
                                 (case (random 50)
-                                  (0 (error "ping failed"))
+                                  (0 (error 'injected-failure))
                                   ((1 2) nil)
                                   (t t)))
                         :max-open-count 3
@@ -424,49 +432,63 @@
                                   ;; Interrupts land only inside an iteration; one pending when
                                   ;; the loop ends is caught here instead of killing the thread.
                                   (handler-case
-                                      (without-interrupts*
-                                        (loop repeat 1000
-                                              do (handler-case
-                                                     (with-local-interrupts*
-                                                       (with-connection (conn pool)
-                                                         ;; Bookkeeping is not interrupted halfway,
-                                                         ;; or a stale entry would look like a double lend.
-                                                         (without-interrupts*
-                                                           (bt2:with-lock-held (stat-lock)
-                                                             (if (gethash conn lent)
-                                                                 (incf double-lends)
-                                                                 (setf (gethash conn lent) t))
-                                                             (when (or (minusp (pool-active-count pool))
-                                                                       (minusp (pool-idle-count pool)))
-                                                               (incf negative-counts)))
-                                                           (unwind-protect
-                                                                (with-local-interrupts*
-                                                                  (when (zerop (random 4))
-                                                                    (bt2:thread-yield)))
+                                      (let ((*armed* t))
+                                        (without-interrupts*
+                                          (loop repeat 1000
+                                                do (handler-case
+                                                       (with-local-interrupts*
+                                                         (with-connection (conn pool)
+                                                           ;; Bookkeeping is not interrupted halfway,
+                                                           ;; or a stale entry would look like a double lend.
+                                                           (without-interrupts*
                                                              (bt2:with-lock-held (stat-lock)
-                                                               (remhash conn lent))))))
-                                                   (error () nil))))
+                                                               (if (gethash conn lent)
+                                                                   (incf double-lends)
+                                                                   (setf (gethash conn lent) t))
+                                                               (when (or (minusp (pool-active-count pool))
+                                                                         (minusp (pool-idle-count pool)))
+                                                                 (incf negative-counts)))
+                                                             (unwind-protect
+                                                                  (with-local-interrupts*
+                                                                    (when (zerop (random 4))
+                                                                      (bt2:thread-yield)))
+                                                               (bt2:with-lock-held (stat-lock)
+                                                                 (remhash conn lent))))))
+                                                     ((or interrupted too-many-open-connection injected-failure) ()
+                                                       nil)
+                                                     (error (e)
+                                                       (bt2:with-lock-held (stat-lock)
+                                                         (push e unexpected-errors)))))))
                                     (interrupted () nil)))))))
              (chaos
                (bt2:make-thread
                 (lambda ()
-                  (loop while (some #'bt2:thread-alive-p workers)
+                  (loop until stop
                         do (let ((target (nth (random (length workers)) workers)))
-                             (when (ignore-errors (interrupt target) t)
+                             (when (ignore-errors
+                                    (bt2:interrupt-thread target
+                                                          (lambda ()
+                                                            (when *armed*
+                                                              (error 'interrupted))))
+                                    t)
                                (incf interrupts)))
-                           (sleep 0.001))))))
-        (mapc #'bt2:join-thread workers)
-        (bt2:join-thread chaos))
-      (when (getf args :idle-timeout)
-        (sleep 0.2))
-      (ok (plusp interrupts) "Interrupts were actually sent")
-      (ok (= double-lends 0) "No connection lent to two borrowers at once")
-      (ok (= double-disconnects 0) "No connection disconnected twice")
-      (ok (= negative-counts 0))
-      (ok (= (pool-active-count pool) 0) "Every slot came back")
-      (ok (= (pool-open-count pool) (pool-idle-count pool)))
-      (ok (= (hash-table-count (pool-created-at-table pool)) (pool-open-count pool)))
-      ;; Interrupted right after the connector returns or inside the disconnector, a physical
-      ;; connection can be left open (see README); each such leak takes one interrupt.
-      (ok (<= (pool-open-count pool) live (+ (pool-open-count pool) interrupts))
-          (format nil "live=~A open=~A interrupts=~A" live (pool-open-count pool) interrupts)))))
+                           (sleep 0.001)))))
+             (finished (every (lambda (worker) (join-within worker 120)) workers)))
+        (setf stop t)
+        (ok finished "Every worker finished")
+        (ok (join-within chaos 10) "The chaos thread stopped")
+        (when finished
+          (when (getf args :idle-timeout)
+            (sleep 0.2))
+          (ok (plusp interrupts) "Interrupts were actually sent")
+          (ok (null unexpected-errors) (format nil "No unexpected errors: ~S" unexpected-errors))
+          (ok (= double-lends 0) "No connection lent to two borrowers at once")
+          (ok (= double-disconnects 0) "No connection disconnected twice")
+          (ok (= negative-counts 0))
+          (ok (= (pool-active-count pool) 0) "Every slot came back")
+          (ok (= (pool-open-count pool) (pool-idle-count pool)))
+          (ok (= (hash-table-count (pool-created-at-table pool)) (pool-open-count pool)))
+          ;; Interrupted right after the connector returns or inside the disconnector, a physical
+          ;; connection can be left open; each such leak takes one interrupt.
+          (ok (<= (pool-open-count pool) live (+ (pool-open-count pool) interrupts))
+              (format nil "live=~A open=~A interrupts=~A" live (pool-open-count pool) interrupts)))))))

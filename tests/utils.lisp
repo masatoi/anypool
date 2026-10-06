@@ -59,5 +59,9 @@ waiting is lost unless the waiter guards against it. The thread returns (:ok val
                 (handler-case (list :ok (funcall fetch-fn))
                   (error (e) (list :error e))))))))
     (unless (bt2:wait-on-semaphore released :timeout 5)
-      (error "The fetch never started waiting: ~S" (bt2:join-thread thread)))
+      ;; Joining a thread stuck elsewhere would hang the test run instead of failing it.
+      (error "The fetch never started waiting: ~S"
+             (if (bt2:thread-alive-p thread)
+                 thread
+                 (bt2:join-thread thread))))
     thread))
