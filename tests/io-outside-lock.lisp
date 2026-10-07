@@ -3,7 +3,6 @@
         #:rove
         #:anypool)
   (:import-from #:anypool
-                #:interrupts-enabled-p
                 #:pool-clock
                 #:pool-created-at-table
                 #:pool-lock
@@ -70,6 +69,11 @@
 (defun interrupted-p (result)
   (and (eq (first result) :error)
        (typep (second result) 'interrupted)))
+
+(defun interrupt-with-throw (thread)
+  "Interrupt THREAD by throwing to its INTERRUPT-EXIT catch. Unlike INTERRUPT's error, no IGNORE-ERRORS
+in the pool can swallow it."
+  (bt2:interrupt-thread thread (lambda () (throw 'interrupt-exit :thrown))))
 
 #+sbcl
 (defun await-blocked-on (thread lock)
@@ -387,15 +391,19 @@
                         args)))
       (putback (fetch pool) pool)
       (setf failing t)
-      (let ((fetching (spawn (lambda () (fetch pool)))))
+      (let ((fetching (bt2:make-thread
+                       (lambda ()
+                         (catch 'interrupt-exit
+                           (handler-case (fetch pool)
+                             (error () :ping-error)))))))
         (await-gate gate)
-        (interrupt fetching)
+        (interrupt-with-throw fetching)
         (multiple-value-bind (finished result) (join-within fetching 2)
           (unless finished
             (open-gate gate 2)
             (ok (join-within fetching 5) "The thread finishes once the gate opens"))
           (ok finished "The disconnect in the cleanup can be interrupted")
-          (ok (and finished (interrupted-p result)) "The interrupt is not ignored like a disconnect error"))
+          (ok (and finished (eq result :thrown)) "The interrupt exits through the disconnect"))
         (ok (= (pool-active-count pool) 0) "The slot is released")
         (setf failing nil)
         (ok (eql (handler-case (fetch pool)
@@ -404,31 +412,119 @@
             "The slot can be used again")))))
 
 #+sbcl
-(deftest interrupt-while-disconnecting-a-failed-ping-is-not-ignored
+(deftest timeout-while-disconnecting-a-rejected-connection-stops-fetch
   (let* ((gate (make-gate))
-         (failing nil)
+         (rejecting nil)
          (pool (make-pool :connector (make-counter)
                           :disconnector (lambda (conn)
                                           (declare (ignore conn))
-                                          (when failing
+                                          (when rejecting
                                             (pass-gate gate)))
                           :ping (lambda (conn)
                                   (declare (ignore conn))
-                                  (not failing))
+                                  (not rejecting))
+                          :max-open-count 1
+                          :timeout 0)))
+    (putback (fetch pool) pool)
+    (setf rejecting t)
+    (let ((fetching (spawn (lambda ()
+                             (handler-case (sb-ext:with-timeout 0.5 (fetch pool))
+                               (sb-ext:timeout () :timed-out))))))
+      (await-gate gate)
+      (multiple-value-bind (finished result) (join-within fetching 3)
+        (unless finished
+          (open-gate gate 2)
+          (ok (join-within fetching 5) "The thread finishes once the gate opens"))
+        (ok (and finished (equal result '(:ok :timed-out)))
+            "fetch stops instead of opening a replacement"))
+      (ok (= (pool-active-count pool) 0) "The slot is released")
+      (setf rejecting nil)
+      (ok (eql (handler-case (fetch pool)
+                 (too-many-open-connection () :too-many))
+               2)
+          "The slot can be used again"))))
+
+(define-condition ping-failure (error) ())
+
+#+sbcl
+(defun deferring-failing-disconnector (record)
+  "A disconnector that fails while deferring interrupts itself, as one protecting its own cleanup may."
+  (lambda (conn)
+    (funcall record conn)
+    (sb-sys:without-interrupts
+      (error "disconnect failed"))))
+
+#+sbcl
+(deftest disconnect-error-with-interrupts-deferred-is-ignored-after-a-rejected-ping
+  (let* ((disconnected '())
+         (rejecting nil)
+         (pool (make-pool :connector (make-counter)
+                          :disconnector (deferring-failing-disconnector
+                                         (lambda (conn) (push conn disconnected)))
+                          :ping (lambda (conn)
+                                  (declare (ignore conn))
+                                  (not rejecting))
+                          :max-open-count 1
+                          :timeout 0)))
+    (putback (fetch pool) pool)
+    (setf rejecting t)
+    (ok (eql (handler-case (fetch pool)
+               (error (e) e))
+             2)
+        "The replacement is returned")
+    (ok (equal disconnected '(1)) "The rejected connection is disconnected")
+    (ok (= (pool-active-count pool) 1))
+    (ok (= (pool-idle-count pool) 0))
+    (ok (= (pool-open-count pool) 1))))
+
+#+sbcl
+(deftest disconnect-error-with-interrupts-deferred-does-not-replace-the-ping-error
+  (let* ((disconnected '())
+         (failing nil)
+         (pool (make-pool :connector (make-counter)
+                          :disconnector (deferring-failing-disconnector
+                                         (lambda (conn) (push conn disconnected)))
+                          :ping (lambda (conn)
+                                  (declare (ignore conn))
+                                  (when failing
+                                    (error 'ping-failure))
+                                  t)
                           :max-open-count 1
                           :timeout 0)))
     (putback (fetch pool) pool)
     (setf failing t)
-    (let ((fetching (spawn (lambda () (fetch pool)))))
-      (await-gate gate)
-      (interrupt fetching)
-      (multiple-value-bind (finished result) (join-within fetching 2)
-        (unless finished
-          (open-gate gate 2)
-          (ok (join-within fetching 5) "The thread finishes once the gate opens"))
-        (ok (and finished (interrupted-p result))
-            "fetch stops instead of opening a replacement"))
-      (ok (= (pool-active-count pool) 0) "The slot is released"))))
+    (ok (eq (handler-case (fetch pool)
+              (ping-failure () :ping-failure)
+              (error (e) e))
+            :ping-failure)
+        "The ping error propagates")
+    (ok (equal disconnected '(1)) "The connection being pinged is disconnected")
+    (ok (= (pool-active-count pool) 0) "The slot is released")
+    (setf failing nil)
+    (ok (eql (handler-case (fetch pool)
+               (too-many-open-connection () :too-many))
+             2)
+        "The slot can be used again")))
+
+#+sbcl
+(deftest disconnect-error-with-interrupts-deferred-is-ignored-for-an-expired-connection
+  (let* ((disconnected '())
+         (pool (make-pool :connector (make-counter)
+                          :disconnector (deferring-failing-disconnector
+                                         (lambda (conn) (push conn disconnected)))
+                          :max-lifetime 1000))
+         (now 0))
+    (setf (pool-clock pool) (lambda () now))
+    (let ((conn (fetch pool)))
+      (setf now (* 5 internal-time-units-per-second))
+      (ok (eq (handler-case (progn (putback conn pool) :returned)
+                (error (e) e))
+              :returned)
+          "putback returns normally"))
+    (ok (equal disconnected '(1)) "The expired connection is disconnected")
+    (ok (= (pool-active-count pool) 0) "The slot is released")
+    (ok (= (pool-open-count pool) 0))
+    (ok (= (hash-table-count (pool-created-at-table pool)) 0))))
 
 #+sbcl
 (deftest with-connection-returns-connection-when-body-is-interrupted
@@ -481,7 +577,7 @@
     (flet ((record (op l)
              (when (and (eq l lock) (eq (bt2:current-thread) waiter))
                ;; Read before taking RECORD-LOCK, whose body re-enables interrupts where allowed.
-               (let ((enabled (interrupts-enabled-p)))
+               (let ((enabled sb-sys:*interrupts-enabled*))
                  (bt2:with-lock-held (record-lock)
                    (push (cons op enabled) recorded))))))
       (with-mock-functions ((bt2:release-lock (l)
@@ -747,12 +843,12 @@
 (deftest with-connection-keeps-the-callers-interrupt-state
   (let ((pool (make-pool :connector (make-counter))))
     (ok (eq (with-connection (conn pool)
-              (interrupts-enabled-p))
+              sb-sys:*interrupts-enabled*)
             t)
         "Enabled in the body for a normal caller")
     (ok (null (without-interrupts*
                 (with-connection (conn pool)
-                  (interrupts-enabled-p))))
+                  sb-sys:*interrupts-enabled*)))
         "Still deferred in the body for a caller that deferred them")))
 
 (deftest with-connection-ignores-a-disconnect-error-for-an-expired-connection

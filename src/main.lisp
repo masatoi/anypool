@@ -52,10 +52,6 @@ Must appear lexically inside WITHOUT-INTERRUPTS*."
   #+sbcl `(sb-sys:allow-with-interrupts ,@body)
   #-sbcl `(progn ,@body))
 
-(defun interrupts-enabled-p ()
-  #+sbcl sb-sys:*interrupts-enabled*
-  #-sbcl t)
-
 (defun make-queue* (size)
   (if (zerop size)
       (make-array 2 :initial-contents '(2 2))
@@ -240,17 +236,11 @@ to the caller. Lifetime is checked again after PING, which may take long enough 
          (not (expired-at-p pool created-at)))))
 
 (defun disconnect-quietly (pool conn)
-  "Disconnect CONN, which the pool will not lend again. Errors from the disconnector are ignored, as
-for a failed ping, but not one an interrupt signals with interrupts still disabled, as SBCL runs it."
-  (let ((disconnector (pool-disconnector pool))
-        (interruptible (interrupts-enabled-p)))
+  "Disconnect CONN, which the pool will not lend again, ignoring any ERROR from the disconnector.
+An error an interrupt signals there is ignored too; SB-EXT:TIMEOUT and non-local exits still take effect."
+  (let ((disconnector (pool-disconnector pool)))
     (when disconnector
-      (block disconnect
-        (handler-bind ((error (lambda (e)
-                                (declare (ignore e))
-                                (unless (and interruptible (not (interrupts-enabled-p)))
-                                  (return-from disconnect nil)))))
-          (funcall disconnector conn))))))
+      (ignore-errors (funcall disconnector conn)))))
 
 #+sbcl
 (defun make-idle-timer (item timeout-fn)
