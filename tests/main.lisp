@@ -15,6 +15,10 @@
 
 (in-package #:anypool/tests)
 
+(defparameter *past-ping-limit* 0.6
+  "Seconds to sleep so that the tests' 0.5-second ping fails. Not 0.5: on SBCL 2.1.10 the coarse
+monotonic clock can read 499998us after (sleep 0.5).")
+
 (deftest make-pool
   (let ((pool (make-pool :name "test pool"
                          :connector (lambda () 'dummy))))
@@ -93,7 +97,7 @@
       (putback object pool)
       (ok (eq (fetch pool) object))
       (putback object pool)
-      (sleep 0.5)
+      (sleep *past-ping-limit*)
       (ng (eq (fetch pool) object)))))
 
 (deftest ping-failure-calls-disconnector
@@ -108,7 +112,7 @@
                                       (+ item (/ internal-time-units-per-second 2)))))))
       (let ((object (fetch pool)))
         (putback object pool)
-        (sleep 0.5)
+        (sleep *past-ping-limit*)
         ;; Ping will fail, disconnector should be called
         (ok (outputs (fetch pool) "disconnected")
             "Disconnector is called when ping fails"))))
@@ -125,7 +129,7 @@
                            :idle-timeout 10000))) ; Long timeout so timer doesn't fire
       (let ((object (fetch pool)))
         (putback object pool)
-        (sleep 0.5)
+        (sleep *past-ping-limit*)
         ;; Ping will fail, disconnector should be called
         (ok (outputs (fetch pool) "disconnected")
             "Disconnector is called when ping fails (with idle-timeout)")))))

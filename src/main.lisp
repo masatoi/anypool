@@ -33,6 +33,25 @@
 (defvar *default-max-open-count* 4)
 (defvar *default-max-idle-count* 2)
 
+;;; SB-EXT:WITH-TIMEOUT and INTERRUPT-THREAD can unwind a thread between any two forms. Slot
+;;; accounting runs with them deferred so a slot is never lost or freed twice. Only SBCL is
+;;; protected; elsewhere these are PROGN.
+
+(defmacro without-interrupts* (&body body)
+  #+sbcl `(sb-sys:without-interrupts ,@body)
+  #-sbcl `(progn ,@body))
+
+(defmacro with-local-interrupts* (&body body)
+  "Allow interrupts in BODY again. Must appear lexically inside WITHOUT-INTERRUPTS*."
+  #+sbcl `(sb-sys:with-local-interrupts ,@body)
+  #-sbcl `(progn ,@body))
+
+(defmacro allow-with-interrupts* (&body body)
+  "Keep interrupts deferred in BODY, but let a WITH-LOCAL-INTERRUPTS* further in allow them.
+Must appear lexically inside WITHOUT-INTERRUPTS*."
+  #+sbcl `(sb-sys:allow-with-interrupts ,@body)
+  #-sbcl `(progn ,@body))
+
 (defun make-queue* (size)
   (if (zerop size)
       (make-array 2 :initial-contents '(2 2))
@@ -190,93 +209,38 @@ Comparing it with 1000 times the elapsed internal time decides expiry without ro
       (error 'resource-already-in-pool :resource conn))
     (setf (gethash conn table) (funcall (pool-clock pool)))))
 
-(defun expired-p (pool conn)
-  "Whether CONN has reached max-lifetime. The clock is not read when max-lifetime is disabled.
-A CONN without a creation time, i.e. not from this pool's connector, counts as expired."
+(defun created-at (pool conn)
+  "With the pool lock held, return the creation time recorded for CONN, or NIL."
+  (let ((table (pool-created-at-table pool)))
+    (and table (gethash conn table))))
+
+(defun expired-at-p (pool created-at)
+  "Whether a connection created at CREATED-AT has reached max-lifetime. The clock is not read when
+max-lifetime is disabled. A NIL CREATED-AT, i.e. not from this pool's connector, counts as expired."
   (when (pool-max-lifetime pool)
-    (let ((created-at (gethash conn (pool-created-at-table pool))))
-      (or (null created-at)
-          (>= (* 1000 (- (funcall (pool-clock pool)) created-at))
-              (pool-lifetime-limit pool))))))
+    (or (null created-at)
+        (>= (* 1000 (- (funcall (pool-clock pool)) created-at))
+            (pool-lifetime-limit pool)))))
 
-(defun lendable-p (pool conn)
-  "With the pool lock held, check an idle CONN before lending it; a rejected CONN is retired.
-Lifetime is checked again after PING, which may take long enough for CONN to expire."
-  (let ((ping (pool-ping pool))
-        (verdict nil))
-    (unwind-protect
-         (setf verdict
-               (cond ((expired-p pool conn) :expired)
-                     ((and ping (not (funcall ping conn))) :ping-failed)
-                     ((expired-p pool conn) :expired)
-                     (t :lendable)))
-      ;; Also when PING signals, since CONN has already left the queue: the error still
-      ;; propagates, but CONN must not stay open outside the pool.
-      (unless (eq verdict :lendable)
-        (forget-created-at pool conn)
-        (let ((disconnector (pool-disconnector pool)))
-          (when disconnector
-            (ignore-errors (funcall disconnector conn))))
-        ;; A signalling PING takes the caller out of fetch, so nobody else would claim
-        ;; the freed slot. The waiter can only proceed after we release the pool lock.
-        (unless verdict
-          (notify-waiter pool))))
-    (eq verdict :lendable)))
+(defun expired-p (pool conn)
+  "With the pool lock held, whether CONN has reached max-lifetime."
+  (and (pool-max-lifetime pool)
+       (expired-at-p pool (created-at pool conn))))
 
-(defmacro define-fetch-impl (name pool-type &key idle-check dequeue-and-validate)
-  "Generate a fetch implementation with type-specific logic."
-  `(defun ,name (pool)
-     (declare (type ,pool-type pool))
-     (with-slots (connector disconnector ping storage lock timeout unlimited-p wait-lock wait-condvar) pool
-       (flet ((allocate-new ()
-                (let ((conn (funcall connector)))
-                  (when (pool-max-lifetime pool)
-                    (register-created-at pool conn))
-                  conn))
-              (can-open-p ()
-                (or unlimited-p
-                    (< (pool-open-count pool) (pool-max-open-count pool)))))
-         (declare (inline allocate-new))
-         (loop
-           (bt2:with-lock-held (lock)
-             (if ,idle-check
-                 ;; Common wait-or-allocate logic
-                 (cond
-                   ((can-open-p)
-                    (return (prog1 (allocate-new)
-                              (incf (pool-active-count pool)))))
-                   ((and (numberp timeout)
-                         (zerop timeout))
-                    (error 'too-many-open-connection
-                           :limit (pool-max-open-count pool)))
-                   (t
-                    (unwind-protect
-                        (or #+ccl
-                            (progn
-                              (bt2:release-lock lock)
-                              (if timeout
-                                  (ccl:timed-wait-on-semaphore wait-condvar (/ timeout 1000d0))
-                                  (ccl:wait-on-semaphore wait-condvar)))
-                            #-ccl
-                            ;; WAIT-LOCK is taken before LOCK is released: putback notifies under
-                            ;; WAIT-LOCK, so its wakeup cannot fall between our check and the wait.
-                            (bt2:with-lock-held (wait-lock)
-                              (bt2:release-lock lock)
-                              (bt2:condition-wait wait-condvar wait-lock
-                                                  :timeout (and timeout (/ timeout 1000d0))))
-                            (error 'too-many-open-connection
-                                   :limit (pool-max-open-count pool)))
-                      (bt2:acquire-lock lock))))
-                 ;; Type-specific dequeue and validation
-                 ,dequeue-and-validate)))))))
+(defun lendable-p (pool conn created-at)
+  "Without the pool lock, check an idle CONN that fetch has taken out. Retiring a rejected CONN is up
+to the caller. Lifetime is checked again after PING, which may take long enough for CONN to expire."
+  (let ((ping (pool-ping pool)))
+    (and (not (expired-at-p pool created-at))
+         (or (null ping) (funcall ping conn))
+         (not (expired-at-p pool created-at)))))
 
-(define-fetch-impl %fetch-without-timeout pool-without-timeout
-  :idle-check (zerop (queue-count storage))
-  :dequeue-and-validate
-  (let ((conn (dequeue storage)))
-    (when (lendable-p pool conn)
-      (incf (pool-active-count pool))
-      (return conn))))
+(defun disconnect-quietly (pool conn)
+  "Disconnect CONN, which the pool will not lend again, ignoring any ERROR from the disconnector.
+An error an interrupt signals there is ignored too; SB-EXT:TIMEOUT and non-local exits still take effect."
+  (let ((disconnector (pool-disconnector pool)))
+    (when disconnector
+      (ignore-errors (funcall disconnector conn)))))
 
 #+sbcl
 (defun make-idle-timer (item timeout-fn)
@@ -286,81 +250,206 @@ Lifetime is checked again after PING, which may take long enough for CONN to exp
         (funcall timeout-fn (item-object item))))
     :thread t))
 
-(define-fetch-impl %fetch-with-timeout pool-with-timeout
-  :idle-check (<= (pool-idle-count pool) 0) ; Fail-safe for cases where pool-idle-count is negative
-  :dequeue-and-validate
-  (let ((item (dequeue storage)))
-    (if (item-timeout-p item)
-        (decf (pool-timeout-in-queue-count pool))
-        (let ((lent nil))
-          ;; Counted as active while LOCK is released below, or a concurrent fetch would
-          ;; see a free slot and open past max-open-count.
-          (incf (pool-active-count pool))
-          ;; The idle timer checks this under LOCK, so from here on it leaves ITEM alone.
-          (setf (item-active-p item) t)
-          (unwind-protect
-               (progn
-                 #+sbcl
-                 (when (item-idle-timer item)
-                   ;; Release the lock once to prevent from deadlock
-                   (bt2:release-lock lock)
-                   (unwind-protect (sb-ext:unschedule-timer (item-idle-timer item))
-                     (bt2:acquire-lock lock)))
-                 (setf lent (lendable-p pool (item-object item))))
-            (unless lent
-              (decf (pool-active-count pool))))
-          (when lent
-            (return (item-object item)))))))
+(defun take-idle (pool)
+  "With the pool lock held, dequeue an idle connection and return it with its creation time and
+queue item, or NIL when none is left. A dequeued item is marked active so its idle timer leaves it alone."
+  (etypecase pool
+    (pool-without-timeout
+     (let ((storage (pool-storage pool)))
+       (unless (zerop (queue-count storage))
+         (let ((conn (dequeue storage)))
+           (values conn (created-at pool conn) nil)))))
+    (pool-with-timeout
+     (loop
+       ;; Fail-safe for cases where pool-idle-count is negative
+       (when (<= (pool-idle-count pool) 0)
+         (return nil))
+       (let ((item (dequeue (pool-storage pool))))
+         (if (item-timeout-p item)
+             (decf (pool-timeout-in-queue-count pool))
+             (let ((conn (item-object item)))
+               (setf (item-active-p item) t)
+               (return (values conn (created-at pool conn) item)))))))))
+
+(defun can-open-p (pool)
+  (or (pool-unlimited-p pool)
+      (< (pool-open-count pool) (pool-max-open-count pool))))
+
+(defun wait-for-slot (pool)
+  "With the pool lock held, wait until a slot may have been freed; the lock is held again on return.
+Return NIL when TIMEOUT runs out, so the caller can signal after releasing the lock."
+  (with-slots (lock timeout wait-lock wait-condvar) pool
+    (unless (and (numberp timeout)
+                 (zerop timeout))
+      ;; SBCL's mutex release and grab are not interrupt-safe: interrupted halfway, LOCK is left
+      ;; taken by no thread and every later fetch hangs. Interrupts are allowed only while sleeping.
+      (without-interrupts*
+        (unwind-protect
+             #+ccl
+             (progn
+               (bt2:release-lock lock)
+               (if timeout
+                   (ccl:timed-wait-on-semaphore wait-condvar (/ timeout 1000d0))
+                   (ccl:wait-on-semaphore wait-condvar)))
+             #-ccl
+             ;; WAIT-LOCK is taken before LOCK is released: putback notifies under
+             ;; WAIT-LOCK, so its wakeup cannot fall between our check and the wait.
+             (bt2:with-lock-held (wait-lock)
+               (bt2:release-lock lock)
+               (allow-with-interrupts*
+                 (bt2:condition-wait wait-condvar wait-lock
+                                     :timeout (and timeout (/ timeout 1000d0)))))
+          (allow-with-interrupts* (bt2:acquire-lock lock)))))))
+
+(defun release-idle-timer (item)
+  "Stop the idle timer of ITEM, which fetch has taken out. Called without the pool lock, which the
+timer callback takes."
+  #+sbcl
+  (when (and item (item-idle-timer item))
+    (sb-ext:unschedule-timer (item-idle-timer item)))
+  #-sbcl
+  (declare (ignore item)))
 
 (defun fetch (pool)
-  "Fetch a connection from the pool."
-  (etypecase pool
-    (pool-without-timeout (%fetch-without-timeout pool))
-    (pool-with-timeout (%fetch-with-timeout pool))))
+  "Fetch a connection from the pool.
+PING and CONNECTOR run without the pool lock, so a slow or stuck one delays only this call. The slot
+they work in is counted as active meanwhile, so the pool never opens more than max-open-count."
+  (let ((lock (pool-lock pool))
+        (held nil)                      ; this call owns a slot counted in ACTIVE-COUNT
+        (owned nil)                     ; a connection only this call holds
+        (lent nil))
+    (without-interrupts*
+      (unwind-protect
+           (progn
+             (with-local-interrupts*
+               (loop
+                 (let ((action nil)
+                       (created-at nil)
+                       (item nil))
+                   (bt2:with-lock-held (lock)
+                     (loop
+                       ;; Counts change together with HELD and OWNED; an interrupt in between
+                       ;; would leak the slot or free it twice.
+                       (without-interrupts*
+                         (multiple-value-bind (conn conn-created-at conn-item) (take-idle pool)
+                           (cond
+                             (conn
+                              (unless held
+                                (incf (pool-active-count pool))
+                                (setf held t))
+                              (setf owned conn
+                                    created-at conn-created-at
+                                    item conn-item
+                                    action :check))
+                             ;; A slot kept after retiring a connection is used, never waited
+                             ;; with, or every slot could end up held by a waiter.
+                             ((or held (can-open-p pool))
+                              (unless held
+                                (incf (pool-active-count pool))
+                                (setf held t))
+                              (setf action :open)))))
+                       (when action
+                         (return))
+                       (unless (wait-for-slot pool)
+                         (return))))
+                   ;; Signalled outside the lock: handlers may do I/O, and every fetch and putback
+                   ;; would wait for them.
+                   (unless action
+                     (error 'too-many-open-connection
+                            :limit (pool-max-open-count pool)))
+                   (ecase action
+                     (:check
+                      (release-idle-timer item)
+                      (when (lendable-p pool owned created-at)
+                        (return))
+                      ;; Ownership and the creation time are dropped together before disconnecting,
+                      ;; so an interrupt there frees the slot without a second disconnect.
+                      (let ((conn owned))
+                        (bt2:with-lock-held (lock)
+                          (without-interrupts*
+                            (forget-created-at pool conn)
+                            (setf owned nil)))
+                        (disconnect-quietly pool conn)))
+                     (:open
+                      (let ((conn (funcall (pool-connector pool))))
+                        (bt2:with-lock-held (lock)
+                          ;; Not OWNED if the connector returned one the pool already manages, so
+                          ;; the cleanup leaves that connection alone.
+                          (without-interrupts*
+                            (when (pool-max-lifetime pool)
+                              (register-created-at pool conn))
+                            (setf owned conn))))
+                      (return))))))
+             ;; The connection is safe from interrupts until FETCH returns; past that the caller
+             ;; must defer them, as WITH-CONNECTION does.
+             (setf lent owned
+                   owned nil))
+        (unless lent
+          ;; The disconnector may exit non-locally; the slot is freed regardless. Interrupts are
+          ;; allowed only in the disconnect, which can block and must stay cancellable.
+          (unwind-protect
+               (when owned
+                 (let ((conn owned))
+                   (bt2:with-lock-held (lock)
+                     (setf owned nil)
+                     (forget-created-at pool conn))
+                   (with-local-interrupts* (disconnect-quietly pool conn))))
+            (when held
+              (release-slot pool))))))
+    lent))
 
 (defun notify-waiter (pool)
   (bt2:with-lock-held ((pool-wait-lock pool))
     (bt2:condition-notify (pool-wait-condvar pool))))
 
+(defun release-slot (pool)
+  "Free one slot counted in ACTIVE-COUNT and wake a waiter to claim it."
+  (without-interrupts*
+    (bt2:with-lock-held ((pool-lock pool))
+      (decf (pool-active-count pool)))
+    (notify-waiter pool)))
+
 (defun call-then-release-slot (pool fn)
   "Call FN, then free the slot of a lent-out connection and wake a waiter even if FN fails.
 The slot is held until FN returns so a waiter cannot open a replacement while the old one is still open."
   (unwind-protect (funcall fn)
-    (bt2:with-lock-held ((pool-lock pool))
-      (decf (pool-active-count pool)))
-    (notify-waiter pool)))
+    (release-slot pool)))
 
 (defmacro define-putback-impl (name pool-type &key before-putback enqueue-logic)
   "Generate a putback implementation with type-specific logic."
   `(defun ,name (conn pool)
      (declare (type ,pool-type pool))
-     ,@(when before-putback (list before-putback))
-     (with-slots (disconnector storage lock) pool
-       (ecase (bt2:with-lock-held (lock)
-                (cond
-                  ((expired-p pool conn)
-                   (forget-created-at pool conn)
-                   :expired)
-                  ((queue-full-p storage)
-                   (forget-created-at pool conn)
-                   :full)
-                  (t
-                   ,enqueue-logic
-                   (decf (pool-active-count pool))
-                   :enqueued)))
-         (:enqueued
-          (notify-waiter pool))
-         (:expired
-          ;; Errors are ignored as for a failed ping; the connection is gone either way.
-          (call-then-release-slot pool
-                                  (lambda ()
-                                    (when disconnector
-                                      (ignore-errors (funcall disconnector conn))))))
-         (:full
-          (call-then-release-slot pool
-                                  (lambda ()
-                                    (when disconnector
-                                      (funcall disconnector conn)))))))
+     ;; Interrupted between the decision and its outcome, CONN would be neither queued nor its
+     ;; slot freed. Only the disconnect, which does I/O, can be interrupted.
+     (without-interrupts*
+       ,@(when before-putback (list before-putback))
+       (with-slots (disconnector storage lock) pool
+         (ecase (bt2:with-lock-held (lock)
+                  (cond
+                    ((expired-p pool conn)
+                     (forget-created-at pool conn)
+                     :expired)
+                    ((queue-full-p storage)
+                     (forget-created-at pool conn)
+                     :full)
+                    (t
+                     ,enqueue-logic
+                     (decf (pool-active-count pool))
+                     :enqueued)))
+           (:enqueued
+            (notify-waiter pool))
+           (:expired
+            ;; Errors are ignored as for a failed ping; the connection is gone either way.
+            (call-then-release-slot pool
+                                    (lambda ()
+                                      (with-local-interrupts*
+                                        (disconnect-quietly pool conn)))))
+           (:full
+            (call-then-release-slot pool
+                                    (lambda ()
+                                      (with-local-interrupts*
+                                        (when disconnector
+                                          (funcall disconnector conn)))))))))
      (values)))
 
 (defun dequeue-timeout-resources (pool)
@@ -412,7 +501,14 @@ The slot is held until FN returns so a waiter cannot open a replacement while th
 
 (defmacro with-connection ((conn pool) &body body)
   (let ((g-pool (gensym "POOL")))
-    `(let* ((,g-pool ,pool)
-            (,conn (fetch ,g-pool)))
-       (unwind-protect (progn ,@body)
-         (putback ,conn ,g-pool)))))
+    ;; FETCH/PUTBACK go through ALLOW-WITH-INTERRUPTS*, not WITH-LOCAL-INTERRUPTS*: their own
+    ;; WITHOUT-INTERRUPTS* would otherwise deliver a pending interrupt before CONN is bound.
+    `(let ((,g-pool ,pool)
+           (,conn nil))
+       (without-interrupts*
+         (unwind-protect
+              (progn
+                (setf ,conn (allow-with-interrupts* (fetch ,g-pool)))
+                (with-local-interrupts* ,@body))
+           (when ,conn
+             (allow-with-interrupts* (putback ,conn ,g-pool))))))))

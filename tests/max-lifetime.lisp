@@ -81,7 +81,8 @@
   (dolist (value (list 0 0.0 -0.0 -1 -1/2 "1000" :forever t #c(1 1)
                        #+sbcl sb-ext:double-float-positive-infinity))
     (ok (signals (make-pool :connector (constantly nil) :max-lifetime value) 'type-error)
-        (format nil "~S is rejected" value))))
+        ;; ~A, not ~S: the description can be printed readably, and an infinity has no readable form.
+        (format nil "~A is rejected" value))))
 
 (defun lent-again-at-p (max-lifetime units)
   "Whether a connection made at clock 0 and returned at once is lent again when the clock reads UNITS."
