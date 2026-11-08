@@ -73,6 +73,140 @@
       (ok (eq (fetch pool) :shared))
       (ok (eq (fetch pool) :shared)))))
 
+(deftest nil-is-a-reusable-resource
+  (dolist (args *variants*)
+    (let* ((calls 0)
+           (pool (apply #'make-pool
+                        :connector (lambda () (incf calls) nil)
+                        :max-open-count 1
+                        :timeout 0
+                        args)))
+      (ok (null (fetch pool)))
+      (ok (= (pool-active-count pool) 1) "NIL occupies a slot while borrowed")
+      (putback nil pool)
+      (ok (= (pool-active-count pool) 0))
+      (ok (= (pool-idle-count pool) 1))
+      (ok (null (fetch pool)))
+      (ok (= calls 1) "The idle NIL is reused without another connector call")
+      (putback nil pool)
+      (with-connection (resource pool)
+        (ok (null resource)))
+      (ok (= (pool-active-count pool) 0) "WITH-CONNECTION returns NIL")
+      (ok (= (pool-idle-count pool) 1)))))
+
+(deftest nil-resource-expires-and-is-disconnected
+  (let* ((now 0)
+         (calls 0)
+         (closed 0)
+         (pool (make-pool :connector (lambda () (incf calls) nil)
+                          :disconnector (lambda (conn)
+                                          (when (null conn) (incf closed)))
+                          :max-open-count 1
+                          :max-lifetime 1000)))
+    (setf (pool-clock pool) (lambda () now))
+    (ok (null (fetch pool)))
+    (putback nil pool)
+    (setf now internal-time-units-per-second)
+    (ok (null (fetch pool)))
+    (ok (= calls 2) "The expired NIL is replaced")
+    (ok (= closed 1) "The disconnector receives NIL")
+    (putback nil pool)))
+
+(define-condition clock-failure (error) ())
+
+(deftest clock-error-after-connecting-nil-retains-failed-cleanup
+  (let* ((attempts 0)
+         (pool (make-pool :connector (constantly nil)
+                          :disconnector (lambda (conn)
+                                          (when (null conn) (incf attempts))
+                                          (error "close failed"))
+                          :max-open-count 1
+                          :max-lifetime 1000
+                          :timeout 0)))
+    (setf (pool-clock pool) (lambda () (error 'clock-failure)))
+    (ok (signals (fetch pool) 'clock-failure) "The original clock error is preserved")
+    (ok (= attempts 1) "Cleanup receives the NIL resource")
+    (ok (= (pool-open-count pool) 1))
+    (let ((record (first (pool-failed-disconnections pool))))
+      (ok record)
+      (when record
+        (ok (null (failed-disconnection-connection record)))
+        (ok (typep (failed-disconnection-condition record) 'simple-error))
+        (ok (acknowledge-failed-disconnection pool record))))
+    (ok (= (pool-open-count pool) 0))))
+
+(deftest failed-expired-disconnect-keeps-its-capacity
+  (let* ((now 0)
+         (pool (make-pool :connector (lambda () (list :connection))
+                          :disconnector (lambda (conn)
+                                          (declare (ignore conn))
+                                          (error "disconnect failed before closing"))
+                          :max-open-count 1
+                          :max-lifetime 1000
+                          :timeout 0)))
+    (setf (pool-clock pool) (lambda () now))
+    (let ((conn (fetch pool)))
+      (setf now (* 2 internal-time-units-per-second))
+      (ok (signals (putback conn pool) 'error) "The disconnect failure reaches the caller")
+      (ok (= (pool-open-count pool) 1) "The unclosed resource still occupies capacity")
+      (ok (signals (fetch pool) 'too-many-open-connection)
+          "A replacement cannot exceed max-open-count"))))
+
+(deftest nonlocal-exit-during-expired-disconnect-keeps-its-capacity
+  (let* ((now 0)
+         (pool (make-pool :connector (lambda () (list :connection))
+                          :disconnector (lambda (conn)
+                                          (declare (ignore conn))
+                                          (throw 'disconnect-exit :aborted))
+                          :max-open-count 1
+                          :max-lifetime 1000
+                          :timeout 0)))
+    (setf (pool-clock pool) (lambda () now))
+    (let ((conn (fetch pool)))
+      (setf now (* 2 internal-time-units-per-second))
+      (ok (eq (catch 'disconnect-exit (putback conn pool)) :aborted))
+      (ok (= (pool-open-count pool) 1) "A non-local exit also retains capacity")
+      (ok (signals (fetch pool) 'too-many-open-connection)))))
+
+(deftest failed-disconnection-requires-explicit-acknowledgment
+  (dolist (conn (list nil (list :connection)))
+    (dolist (close-first '(nil t))
+      (let* ((now 0)
+             (attempts 0)
+             (closed nil)
+             (pool (make-pool :connector (constantly conn)
+                              :disconnector (lambda (c)
+                                              (declare (ignore c))
+                                              (incf attempts)
+                                              (when close-first (setf closed t))
+                                              (error "disconnect failed"))
+                              :max-open-count 1
+                              :max-lifetime 1000
+                              :timeout 0))
+             (other-pool (make-pool :connector (constantly :other))))
+        (setf (pool-clock pool) (lambda () now))
+        (fetch pool)
+        (setf now (* 2 internal-time-units-per-second))
+        (ignore-errors (putback conn pool))
+        (let ((records (and (fboundp 'anypool::pool-failed-disconnections)
+                            (funcall 'anypool::pool-failed-disconnections pool))))
+          (ok (= (length records) 1) "A failed close remains visible")
+          (when records
+            (let ((record (first records)))
+              (ok (eq (funcall 'anypool::failed-disconnection-connection record) conn))
+              (ok (typep (funcall 'anypool::failed-disconnection-condition record) 'error))
+              (ng (funcall 'anypool::acknowledge-failed-disconnection other-pool record)
+                  "A different pool cannot release the slot")
+              ;; For a close that failed before closing, the caller closes it out of band.
+              (unless close-first (setf closed t))
+              (ok closed)
+              (ok (funcall 'anypool::acknowledge-failed-disconnection pool record))
+              (ng (funcall 'anypool::acknowledge-failed-disconnection pool record)
+                  "A stale record cannot release the slot twice")
+              (ok (= attempts 1) "Acknowledgment does not call the disconnector again")
+              (ok (= (pool-open-count pool) 0))
+              (ok (null (funcall 'anypool::pool-failed-disconnections pool))))))))))
+
 (deftest max-lifetime-validation
   (dolist (value (list 1 60000 1/3 0.5 2.5d0))
     (ok (eql (pool-max-lifetime (make-pool :connector (constantly nil) :max-lifetime value))
@@ -284,23 +418,30 @@
 
 #+sbcl
 (deftest max-lifetime-expiry-on-putback-wakes-waiter
-  (dolist (disconnector (list #'disconnect
-                              nil
-                              (lambda (conn)
-                                (disconnect conn)
-                                (error "disconnect failed"))))
+  (dolist (scenario (list (list #'disconnect nil)
+                          (list nil nil)
+                          (list (lambda (conn)
+                                  (disconnect conn)
+                                  (error "disconnect failed"))
+                                t)))
     (dolist (args *variants*)
       (let* ((pool (apply #'make-lifetime-pool (make-backend)
                           :max-lifetime 1000
                           :max-open-count 1
                           :timeout 2000
-                          :disconnector disconnector
+                          :disconnector (first scenario)
                           args))
              (advance (install-manual-clock pool))
              (conn (fetch pool))
              (waiter (start-waiting-fetch (lambda () (fetch pool)) (pool-lock pool))))
         (funcall advance 5000)
-        (putback conn pool)
+        (if (second scenario)
+            (progn
+              (ok (signals (putback conn pool) 'error))
+              (let ((record (first (pool-failed-disconnections pool))))
+                (ok record)
+                (when record (ok (acknowledge-failed-disconnection pool record)))))
+            (putback conn pool))
         (let ((result (bt2:join-thread waiter)))
           (ok (eq (first result) :ok) "The waiter is woken")
           (ok (and (conn-p (second result))
@@ -350,19 +491,23 @@
                                (let ((*random-state* (make-random-state t)))
                                  (handler-case
                                      (loop repeat 2000
-                                           do (let ((conn (fetch pool)))
-                                                (bt2:with-lock-held (stat-lock)
-                                                  (if (gethash conn lent)
-                                                      (incf double-lends)
-                                                      (setf (gethash conn lent) t))
-                                                  (when (or (minusp (pool-active-count pool))
-                                                            (minusp (pool-idle-count pool)))
-                                                    (incf negative-counts)))
-                                                (when (zerop (random 4))
-                                                  (bt2:thread-yield))
-                                                (bt2:with-lock-held (stat-lock)
-                                                  (remhash conn lent))
-                                                (putback conn pool)))
+                                           do (handler-case
+                                                  (let ((conn (fetch pool)))
+                                                    (bt2:with-lock-held (stat-lock)
+                                                      (if (gethash conn lent)
+                                                          (incf double-lends)
+                                                          (setf (gethash conn lent) t))
+                                                      (when (or (minusp (pool-active-count pool))
+                                                                (minusp (pool-idle-count pool)))
+                                                        (incf negative-counts)))
+                                                    (when (zerop (random 4))
+                                                      (bt2:thread-yield))
+                                                    (bt2:with-lock-held (stat-lock)
+                                                      (remhash conn lent))
+                                                    (putback conn pool))
+                                                ;; The shared test clock can advance past a fresh
+                                                ;; connection's lifetime before registration.
+                                                (connection-expired-before-use () nil)))
                                    (error (e)
                                      (bt2:with-lock-held (stat-lock)
                                        (push e errors))))))))))
@@ -378,10 +523,7 @@
       (ok (= (pool-open-count pool) (pool-idle-count pool)))
       (ok (= live (pool-open-count pool)) "Every discarded connection was disconnected")
       (ok (= (tracked-count pool) (pool-open-count pool)))
-      ;; The idle timer disconnects outside the pool lock, so only without it is the
-      ;; number of physical connections bounded at every instant.
-      (unless (getf args :idle-timeout)
-        (ok (<= max-live max-open) "Never more physical connections than max-open-count")))))
+      (ok (<= max-live max-open) "Never more physical connections than max-open-count"))))
 
 (deftest max-lifetime-callback-errors
   (testing "a failing connector leaves nothing behind"
@@ -419,18 +561,26 @@
              (advance (install-manual-clock pool))
              (conn (fetch pool)))
         (funcall advance 5000)
-        (ok (eq (progn (putback conn pool) :returned) :returned) "putback returns normally")
+        (ok (signals (putback conn pool) 'simple-error) "The failure reaches the caller")
         (ok (= (conn-disconnect-count conn) 1))
-        (ok (= (pool-open-count pool) 0))
-        (ok (= (tracked-count pool) 0))
+        (ok (= (pool-open-count pool) 1))
+        (ok (= (tracked-count pool) 1))
+        (let ((record (first (pool-failed-disconnections pool))))
+          (ok record)
+          (when record (ok (acknowledge-failed-disconnection pool record))))
         (let ((conn (fetch pool)))
           (putback conn pool)
           (funcall advance 5000)
+          (ok (signals (fetch pool) 'simple-error) "fetch reports an idle close failure")
+          (ok (= (conn-disconnect-count conn) 1))
+          (ok (= (pool-open-count pool) 1))
+          (ok (= (tracked-count pool) 1))
+          (let ((record (first (pool-failed-disconnections pool))))
+            (ok record)
+            (when record (ok (acknowledge-failed-disconnection pool record))))
           (let ((next (fetch pool)))
-            (ng (eq next conn) "fetch moves on to a new connection")
-            (ok (= (conn-disconnect-count conn) 1))
-            (ok (= (pool-open-count pool) 1))
-            (ok (= (tracked-count pool) 1))))))))
+            (ng (eq next conn) "A new connection is available after acknowledgment")
+            (putback next pool)))))))
 
 (deftest max-lifetime-bookkeeping-cleared
   (dolist (args *variants*)

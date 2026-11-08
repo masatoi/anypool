@@ -12,11 +12,14 @@
 
 (defsystem "anypool/tests"
   :depends-on ("rove"
-               "anypool")
+               "anypool"
+               "anypool/middleware"
+               "lack")
   :components
   ((:module "tests"
     :components ((:file "utils")
                  (:file "main" :depends-on ("utils"))
+                 (:file "middleware")
                  (:file "max-lifetime" :depends-on ("utils"))
                  (:file "io-outside-lock" :depends-on ("utils")))))
   :perform (test-op (o c) (symbol-call :rove '#:run c)))
