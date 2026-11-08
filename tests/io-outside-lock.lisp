@@ -92,7 +92,7 @@ in the pool can swallow it."
         (error "The thread never blocked on the lock"))))
 
 #+sbcl
-(deftest putback-interrupted-while-disconnecting-releases-slot
+(deftest putback-interrupted-while-disconnecting-retains-slot
   (let* ((gate (make-gate))
          (pool (make-pool :connector (make-counter)
                           :disconnector (lambda (conn)
@@ -111,8 +111,12 @@ in the pool can swallow it."
           (open-gate gate))
         (ok finished "The disconnect can still be interrupted")
         (ok (and finished (interrupted-p result))))
+      (let ((record (first (pool-failed-disconnections pool))))
+        (ok record "The interrupted disconnect is retained")
+        (when record
+          (ok (acknowledge-failed-disconnection pool record))))
       (let ((result (bt2:join-thread waiter)))
-        (ok (eq (first result) :ok) "The slot is released and the waiter woken")
+        (ok (eq (first result) :ok) "Acknowledgment releases the slot and wakes the waiter")
         (ok (eql (second result) 2))))))
 
 (deftest connect-does-not-block-other-borrowers
@@ -292,7 +296,7 @@ in the pool can swallow it."
     (ok (= (pool-active-count pool) 0))
     (ok (eq (fetch pool) :conn) "The slot is free again")))
 
-(deftest non-local-exit-from-disconnector-in-cleanup-releases-slot
+(deftest non-local-exit-from-disconnector-in-cleanup-retains-slot
   (let* ((pool (make-pool :connector (make-counter)
                           :disconnector (lambda (conn)
                                           (declare (ignore conn))
@@ -308,7 +312,10 @@ in the pool can swallow it."
                 (error () :ping-error)))
             :thrown)
         "The cleanup retires the connection being pinged")
-    (ok (= (pool-active-count pool) 0) "The slot is released")
+    (ok (= (pool-active-count pool) 1) "The uncertain connection retains its slot")
+    (let ((record (first (pool-failed-disconnections pool))))
+      (ok record)
+      (when record (ok (acknowledge-failed-disconnection pool record))))
     (ok (eql (handler-case (fetch pool)
                (too-many-open-connection () :too-many))
              2)
@@ -371,7 +378,7 @@ in the pool can swallow it."
             (ok (eql (second result) 2))))))))
 
 #+sbcl
-(deftest interrupt-during-cleanup-disconnect-releases-slot
+(deftest interrupt-during-cleanup-disconnect-retains-slot
   (dolist (args (list '() #+sbcl '(:idle-timeout 600000)))
     (let* ((gate (make-gate))
            (failing nil)
@@ -404,7 +411,10 @@ in the pool can swallow it."
             (ok (join-within fetching 5) "The thread finishes once the gate opens"))
           (ok finished "The disconnect in the cleanup can be interrupted")
           (ok (and finished (eq result :thrown)) "The interrupt exits through the disconnect"))
-        (ok (= (pool-active-count pool) 0) "The slot is released")
+        (ok (= (pool-active-count pool) 1) "The uncertain connection keeps its slot")
+        (let ((record (first (pool-failed-disconnections pool))))
+          (ok record)
+          (when record (ok (acknowledge-failed-disconnection pool record))))
         (setf failing nil)
         (ok (eql (handler-case (fetch pool)
                    (too-many-open-connection () :too-many))
@@ -437,7 +447,10 @@ in the pool can swallow it."
           (ok (join-within fetching 5) "The thread finishes once the gate opens"))
         (ok (and finished (equal result '(:ok :timed-out)))
             "fetch stops instead of opening a replacement"))
-      (ok (= (pool-active-count pool) 0) "The slot is released")
+      (ok (= (pool-active-count pool) 1) "The uncertain connection keeps its slot")
+      (let ((record (first (pool-failed-disconnections pool))))
+        (ok record)
+        (when record (ok (acknowledge-failed-disconnection pool record))))
       (setf rejecting nil)
       (ok (eql (handler-case (fetch pool)
                  (too-many-open-connection () :too-many))
@@ -445,6 +458,142 @@ in the pool can swallow it."
           "The slot can be used again"))))
 
 (define-condition ping-failure (error) ())
+
+(deftest rejected-ping-disconnect-failure-retains-the-slot
+  (let* ((calls 0)
+         (pool (make-pool :connector (lambda () (list (incf calls)))
+                          :ping (constantly nil)
+                          :disconnector (lambda (conn)
+                                          (declare (ignore conn))
+                                          (error "disconnect failed"))
+                          :max-open-count 1
+                          :timeout 0)))
+    (putback (fetch pool) pool)
+    (ok (signals (fetch pool) 'error) "The failed close reaches the caller")
+    (ok (= calls 1) "No replacement is opened after a failed close")
+    (ok (= (pool-open-count pool) 1))
+    (ok (= (length (pool-failed-disconnections pool)) 1))
+    (ok (signals (fetch pool) 'too-many-open-connection))))
+
+(deftest ping-error-keeps-failed-cleanup-and-original-error
+  (let* ((pool (make-pool :connector (lambda () (list :conn))
+                          :ping (lambda (conn) (declare (ignore conn)) (error 'ping-failure))
+                          :disconnector (lambda (conn)
+                                          (declare (ignore conn))
+                                          (error "disconnect failed"))
+                          :max-open-count 1
+                          :timeout 0)))
+    (putback (fetch pool) pool)
+    (ok (signals (fetch pool) 'ping-failure) "The original ping error is preserved")
+    (ok (= (pool-open-count pool) 1))
+    (ok (= (length (pool-failed-disconnections pool)) 1))
+    (ok (signals (fetch pool) 'too-many-open-connection))))
+
+(deftest rejected-connection-remains-registered-until-disconnected
+  (dolist (max-lifetime '(nil 60000))
+    (let* ((gate (make-gate))
+           (conn (list :shared))
+           (calls 0)
+           (pool (make-pool :connector (lambda ()
+                                         (case (incf calls)
+                                           ((1 2) conn)
+                                           (otherwise (list :replacement))))
+                            :ping (constantly nil)
+                            :disconnector (lambda (c) (declare (ignore c)) (pass-gate gate))
+                            :max-open-count 2
+                            :max-lifetime max-lifetime
+                            :timeout 0)))
+      (putback (fetch pool) pool)
+      (let ((fetching (spawn (lambda () (fetch pool)))))
+        (await-gate gate)
+        (unwind-protect
+             (ok (signals (fetch pool) 'anypool::resource-already-in-pool)
+                 "The connector cannot lend an object while it is being disconnected")
+          (open-gate gate))
+        (multiple-value-bind (finished result) (join-within fetching 5)
+          (ok (and finished (eq (first result) :ok))))))))
+
+#+sbcl
+(deftest idle-timeout-holds-capacity-until-close-finishes
+  (let* ((gate (make-gate))
+         (closed (bt2:make-semaphore))
+         (pool (make-pool :connector (make-counter)
+                          :disconnector (lambda (conn)
+                                          (declare (ignore conn))
+                                          (pass-gate gate)
+                                          (bt2:signal-semaphore closed))
+                          :max-open-count 1
+                          :idle-timeout 20
+                          :timeout 0)))
+    (putback (fetch pool) pool)
+    (await-gate gate)
+    (unwind-protect
+         (ok (signals (fetch pool) 'too-many-open-connection)
+             "An idle connection being disconnected still occupies a slot")
+      (open-gate gate))
+    (ok (bt2:wait-on-semaphore closed :timeout 5))))
+
+#+sbcl
+(deftest acknowledging-failed-close-wakes-waiter
+  (let* ((pool (make-pool :connector (make-counter)
+                          :disconnector (lambda (conn)
+                                          (declare (ignore conn))
+                                          (error "disconnect failed"))
+                          :max-open-count 1
+                          :max-idle-count 0
+                          :timeout 2000))
+         (conn (fetch pool))
+         (waiter (start-waiting-fetch (lambda () (fetch pool)) (pool-lock pool))))
+    (ok (signals (putback conn pool) 'error))
+    (let ((record (first (pool-failed-disconnections pool))))
+      (ok record)
+      (when record
+        (ok (acknowledge-failed-disconnection pool record))))
+    (let ((result (bt2:join-thread waiter)))
+      (ok (equal result '(:ok 2)) "A waiter can open a replacement after acknowledgment"))))
+
+(deftest concurrent-acknowledgments-release-a-slot-once
+  (let* ((gate (make-gate))
+         (pool (make-pool :connector (lambda () (list :connection))
+                          :disconnector (lambda (conn)
+                                          (declare (ignore conn))
+                                          (error "close failed"))
+                          :max-open-count 1
+                          :max-idle-count 0))
+         (conn (fetch pool)))
+    (ok (signals (putback conn pool) 'error))
+    (let* ((record (first (pool-failed-disconnections pool)))
+           (threads (loop repeat 2
+                          collect (spawn (lambda ()
+                                           (pass-gate gate)
+                                           (acknowledge-failed-disconnection pool record))))))
+      (await-gate gate)
+      (await-gate gate)
+      (open-gate gate 2)
+      (let ((results (mapcar #'bt2:join-thread threads)))
+        (ok (= (count t results :key #'second) 1) "Only one acknowledgment succeeds")
+        (ok (= (pool-open-count pool) 0))
+        (ok (null (pool-failed-disconnections pool)))))))
+
+#+sbcl
+(deftest idle-timeout-failed-close-is-quarantined
+  (let* ((attempted (bt2:make-semaphore))
+         (pool (make-pool :connector (make-counter)
+                          :disconnector (lambda (conn)
+                                          (declare (ignore conn))
+                                          (bt2:signal-semaphore attempted)
+                                          (error "idle close failed"))
+                          :max-open-count 1
+                          :idle-timeout 20
+                          :timeout 0)))
+    (putback (fetch pool) pool)
+    (ok (bt2:wait-on-semaphore attempted :timeout 5))
+    (ok (loop repeat 500
+              thereis (pool-failed-disconnections pool)
+              do (sleep 0.01))
+        "The timer records the failure")
+    (ok (= (pool-open-count pool) 1))
+    (ok (signals (fetch pool) 'too-many-open-connection))))
 
 #+sbcl
 (defun deferring-failing-disconnector (record)
@@ -455,7 +604,7 @@ in the pool can swallow it."
       (error "disconnect failed"))))
 
 #+sbcl
-(deftest disconnect-error-with-interrupts-deferred-is-ignored-after-a-rejected-ping
+(deftest disconnect-error-with-interrupts-deferred-after-a-rejected-ping
   (let* ((disconnected '())
          (rejecting nil)
          (pool (make-pool :connector (make-counter)
@@ -468,14 +617,16 @@ in the pool can swallow it."
                           :timeout 0)))
     (putback (fetch pool) pool)
     (setf rejecting t)
-    (ok (eql (handler-case (fetch pool)
-               (error (e) e))
-             2)
-        "The replacement is returned")
+    (ok (signals (fetch pool) 'simple-error) "The disconnect error propagates")
     (ok (equal disconnected '(1)) "The rejected connection is disconnected")
     (ok (= (pool-active-count pool) 1))
     (ok (= (pool-idle-count pool) 0))
-    (ok (= (pool-open-count pool) 1))))
+    (ok (= (pool-open-count pool) 1))
+    (let ((record (first (pool-failed-disconnections pool))))
+      (ok record)
+      (when record (ok (acknowledge-failed-disconnection pool record))))
+    (setf rejecting nil)
+    (ok (eql (fetch pool) 2))))
 
 #+sbcl
 (deftest disconnect-error-with-interrupts-deferred-does-not-replace-the-ping-error
@@ -499,7 +650,10 @@ in the pool can swallow it."
             :ping-failure)
         "The ping error propagates")
     (ok (equal disconnected '(1)) "The connection being pinged is disconnected")
-    (ok (= (pool-active-count pool) 0) "The slot is released")
+    (ok (= (pool-active-count pool) 1) "The slot is retained")
+    (let ((record (first (pool-failed-disconnections pool))))
+      (ok record)
+      (when record (ok (acknowledge-failed-disconnection pool record))))
     (setf failing nil)
     (ok (eql (handler-case (fetch pool)
                (too-many-open-connection () :too-many))
@@ -507,7 +661,7 @@ in the pool can swallow it."
         "The slot can be used again")))
 
 #+sbcl
-(deftest disconnect-error-with-interrupts-deferred-is-ignored-for-an-expired-connection
+(deftest disconnect-error-with-interrupts-deferred-for-an-expired-connection
   (let* ((disconnected '())
          (pool (make-pool :connector (make-counter)
                           :disconnector (deferring-failing-disconnector
@@ -517,14 +671,15 @@ in the pool can swallow it."
     (setf (pool-clock pool) (lambda () now))
     (let ((conn (fetch pool)))
       (setf now (* 5 internal-time-units-per-second))
-      (ok (eq (handler-case (progn (putback conn pool) :returned)
-                (error (e) e))
-              :returned)
-          "putback returns normally"))
+      (ok (signals (putback conn pool) 'simple-error) "The disconnect error propagates"))
     (ok (equal disconnected '(1)) "The expired connection is disconnected")
-    (ok (= (pool-active-count pool) 0) "The slot is released")
-    (ok (= (pool-open-count pool) 0))
-    (ok (= (hash-table-count (pool-created-at-table pool)) 0))))
+    (ok (= (pool-active-count pool) 1) "The slot is retained")
+    (ok (= (pool-open-count pool) 1))
+    (ok (= (hash-table-count (pool-created-at-table pool)) 1))
+    (let ((record (first (pool-failed-disconnections pool))))
+      (ok record)
+      (when record (ok (acknowledge-failed-disconnection pool record))))
+    (ok (= (pool-open-count pool) 0))))
 
 #+sbcl
 (deftest with-connection-returns-connection-when-body-is-interrupted
@@ -624,7 +779,7 @@ in the pool can swallow it."
     (ok (= (pool-idle-count pool) 1))))
 
 #+sbcl
-(deftest interrupt-while-retiring-a-rejected-connection-forgets-it
+(deftest interrupt-while-retiring-a-rejected-connection-keeps-accounting
   (let* ((pinged (bt2:make-semaphore))
          (locked (bt2:make-semaphore))
          (rejecting nil)
@@ -658,10 +813,19 @@ in the pool can swallow it."
         (bt2:release-lock lock))
       (multiple-value-bind (finished result) (join-within fetching 2)
         (ok (and finished (interrupted-p result)) "The fetch is interrupted while retiring")))
-    (ok (= (pool-active-count pool) 0) "The slot is released")
+    (let ((record (first (pool-failed-disconnections pool))))
+      (if record
+          (progn
+            (ok (= (pool-active-count pool) 1) "An interrupted close retains the slot")
+            (ok (<= (gethash 1 disconnects 0) 1))
+            (when (zerop (gethash 1 disconnects 0))
+              (incf (gethash 1 disconnects 0)))
+            (ok (acknowledge-failed-disconnection pool record)))
+          (progn
+            (ok (= (pool-active-count pool) 0) "A completed close releases the slot")
+            (ok (= (gethash 1 disconnects 0) 1)))))
     (ok (= (hash-table-count (pool-created-at-table pool)) (pool-open-count pool))
-        "The creation time of the retired connection is forgotten")
-    (ok (= (gethash 1 disconnects 0) 1) "The retired connection is disconnected once")))
+        "The retired connection's identity is accounted for")))
 
 (deftest fetch-keeps-the-slot-while-disconnecting-a-rejected-connection
   (let* ((gate (make-gate))
@@ -779,7 +943,7 @@ in the pool can swallow it."
       (ok (= (pool-open-count pool) 1)))))
 
 #+sbcl
-(deftest interrupt-right-after-connect-leaks-only-the-connection
+(deftest interrupt-right-after-connect-disconnects-the-connection
   (let* ((connected (bt2:make-semaphore))
          (locked (bt2:make-semaphore))
          (disconnected '())
@@ -809,7 +973,143 @@ in the pool can swallow it."
     (ok (= (pool-active-count pool) 0) "The slot is released")
     (ok (= (hash-table-count (pool-created-at-table pool)) (pool-open-count pool) 0)
         "No creation time is left for the connection")
-    (ok (null disconnected) "The physical connection leaks, as documented")))
+    (ok (equal disconnected (list conn)) "The returned connection is disconnected")))
+
+#+sbcl
+(deftest interrupted-duplicate-connector-does-not-disconnect-borrowed-resource
+  (dolist (max-lifetime '(nil 600000))
+    (let* ((connected (bt2:make-semaphore))
+           (proceed (bt2:make-semaphore))
+           (calls 0)
+           (disconnected '())
+           (conn (list :shared))
+           (pool (make-pool :connector (lambda ()
+                                         (when (= (incf calls) 2)
+                                           (bt2:signal-semaphore connected)
+                                           (bt2:wait-on-semaphore proceed))
+                                         conn)
+                            :disconnector (lambda (c) (push c disconnected))
+                            :max-open-count 2
+                            :max-lifetime max-lifetime))
+           (lock (pool-lock pool)))
+      (ok (eq (fetch pool) conn))
+      (let ((fetching (spawn (lambda () (fetch pool)))))
+        (ok (bt2:wait-on-semaphore connected :timeout 5))
+        (bt2:acquire-lock lock)
+        (unwind-protect
+             (progn
+               (bt2:signal-semaphore proceed)
+               (await-blocked-on fetching lock)
+               (interrupt fetching))
+          (bt2:release-lock lock))
+        (multiple-value-bind (finished result) (join-within fetching 2)
+          (ok (and finished (interrupted-p result))))
+        (ok (null disconnected) "The other borrower still owns the shared object")
+        (ok (= (pool-active-count pool) 1))
+        (putback conn pool)))))
+
+#+sbcl
+(deftest max-lifetime-includes-registration-lock-wait
+  (let* ((connected (bt2:make-semaphore))
+         (proceed (bt2:make-semaphore))
+         (now 0)
+         (calls 0)
+         (closed '())
+         (pool (make-pool :connector (lambda ()
+                                       (when (= (incf calls) 1)
+                                         (bt2:signal-semaphore connected)
+                                         (bt2:wait-on-semaphore proceed))
+                                       (list calls))
+                          :disconnector (lambda (conn) (push conn closed))
+                          :max-lifetime 1000))
+         (lock (pool-lock pool)))
+    (setf (pool-clock pool) (lambda () now))
+    (let ((fetching (spawn (lambda () (fetch pool)))))
+      (ok (bt2:wait-on-semaphore connected :timeout 5))
+      (bt2:acquire-lock lock)
+      (unwind-protect
+           (progn
+             (bt2:signal-semaphore proceed)
+             (await-blocked-on fetching lock)
+             (setf now (/ internal-time-units-per-second 2)))
+        (bt2:release-lock lock))
+      (let* ((result (bt2:join-thread fetching))
+             (conn (second result)))
+        (ok (eq (first result) :ok))
+        (putback conn pool)
+        (setf now internal-time-units-per-second)
+        (let ((replacement (fetch pool)))
+          (ng (eq replacement conn) "Age is measured from connector return")
+          (ok (equal closed (list conn)))
+          (putback replacement pool))))))
+
+#+sbcl
+(deftest fresh-connection-expired-before-registration-is-not-lent
+  (let* ((connected (bt2:make-semaphore))
+         (proceed (bt2:make-semaphore))
+         (now 0)
+         (closed '())
+         (conn (list :connection))
+         (pool (make-pool :connector (lambda ()
+                                       (bt2:signal-semaphore connected)
+                                       (bt2:wait-on-semaphore proceed)
+                                       conn)
+                          :disconnector (lambda (c) (push c closed))
+                          :max-lifetime 1000))
+         (lock (pool-lock pool)))
+    (setf (pool-clock pool) (lambda () now))
+    (let ((fetching (spawn (lambda () (fetch pool)))))
+      (ok (bt2:wait-on-semaphore connected :timeout 5))
+      (bt2:acquire-lock lock)
+      (unwind-protect
+           (progn
+             (bt2:signal-semaphore proceed)
+             (await-blocked-on fetching lock)
+             (setf now (* 2 internal-time-units-per-second)))
+        (bt2:release-lock lock))
+      (multiple-value-bind (finished result) (join-within fetching 2)
+        (ok (and finished (eq (first result) :error))
+            "An expired fresh connection is not lent or retried forever"))
+      (ok (equal closed (list conn)))
+      (ok (= (pool-open-count pool) 0)))))
+
+#+sbcl
+(deftest idle-connection-expired-while-waiting-to-be-lent-is-replaced
+  (let* ((checked (bt2:make-semaphore))
+         (proceed (bt2:make-semaphore))
+         (now 0)
+         (pinged nil)
+         (gated nil)
+         (closed '())
+         (pool (make-pool :connector (lambda () (list :connection))
+                          :ping (lambda (conn) (declare (ignore conn)) (setf pinged t))
+                          :disconnector (lambda (conn) (push conn closed))
+                          :max-lifetime 1000))
+         (lock (pool-lock pool)))
+    (setf (pool-clock pool)
+          (lambda ()
+            (let ((observed now))
+              (when (and pinged (not gated))
+                (setf gated t)
+                (bt2:signal-semaphore checked)
+                (bt2:wait-on-semaphore proceed))
+              observed)))
+    (let ((conn (fetch pool)))
+      (putback conn pool)
+      (let ((fetching (spawn (lambda () (fetch pool)))))
+        (ok (bt2:wait-on-semaphore checked :timeout 5))
+        (bt2:acquire-lock lock)
+        (unwind-protect
+             (progn
+               (bt2:signal-semaphore proceed)
+               (await-blocked-on fetching lock)
+               (setf now (* 2 internal-time-units-per-second)))
+          (bt2:release-lock lock))
+        (multiple-value-bind (finished result) (join-within fetching 5)
+          (ok (and finished (eq (first result) :ok)))
+          (when finished
+            (ng (eq (second result) conn) "A connection that expired while waiting is not lent")))
+        (ok (equal closed (list conn)))))))
 
 (deftest with-connection-puts-back-on-non-local-exit
   (let ((pool (make-pool :connector (make-counter))))
@@ -851,7 +1151,7 @@ in the pool can swallow it."
                   sb-sys:*interrupts-enabled*)))
         "Still deferred in the body for a caller that deferred them")))
 
-(deftest with-connection-ignores-a-disconnect-error-for-an-expired-connection
+(deftest with-connection-reports-a-disconnect-error-for-an-expired-connection
   (let* ((pool (make-pool :connector (make-counter)
                           :disconnector (lambda (conn)
                                           (declare (ignore conn))
@@ -859,14 +1159,177 @@ in the pool can swallow it."
                           :max-lifetime 1000))
          (now 0))
     (setf (pool-clock pool) (lambda () now))
-    (ok (eq (with-connection (conn pool)
-              (setf now (* 5 internal-time-units-per-second))
-              :done)
-            :done)
-        "The body's value is returned")
-    (ok (= (pool-active-count pool) 0) "The slot is freed")
-    (ok (= (pool-open-count pool) 0))
-    (ok (= (hash-table-count (pool-created-at-table pool)) 0))))
+    (ok (signals (with-connection (conn pool)
+                   (setf now (* 5 internal-time-units-per-second))
+                   :done)
+                 'simple-error)
+        "The cleanup failure reaches the caller")
+    (ok (= (pool-active-count pool) 1) "The uncertain connection retains its slot")
+    (ok (= (pool-open-count pool) 1))
+    (ok (= (hash-table-count (pool-created-at-table pool)) 1))
+    (let ((record (first (pool-failed-disconnections pool))))
+      (ok record)
+      (when record (ok (acknowledge-failed-disconnection pool record))))
+    (ok (= (pool-open-count pool) 0))))
+
+(define-condition application-failure (error) ())
+
+(deftest with-connection-preserves-the-body-error-if-cleanup-fails
+  (let* ((now 0)
+         (pool (make-pool :connector (make-counter)
+                          :disconnector (lambda (conn)
+                                          (declare (ignore conn))
+                                          (error "close failed"))
+                          :max-lifetime 1000)))
+    (setf (pool-clock pool) (lambda () now))
+    (ok (signals (with-connection (conn pool)
+                   (setf now (* 2 internal-time-units-per-second))
+                   (error 'application-failure))
+                 'application-failure)
+        "The body error takes precedence")
+    (ok (= (length (pool-failed-disconnections pool)) 1))))
+
+(deftest with-connection-preserves-a-nonlocal-body-exit-if-cleanup-signals
+  (let* ((now 0)
+         (pool (make-pool :connector (make-counter)
+                          :disconnector (lambda (conn)
+                                          (declare (ignore conn))
+                                          (error "close failed"))
+                          :max-lifetime 1000)))
+    (setf (pool-clock pool) (lambda () now))
+    (ok (eq (handler-case
+                (catch 'body-exit
+                  (with-connection (conn pool)
+                    (setf now (* 2 internal-time-units-per-second))
+                    (throw 'body-exit :body-result)))
+              (error () :cleanup-error))
+            :body-result))
+    (ok (= (length (pool-failed-disconnections pool)) 1))))
+
+(deftest quarantined-object-is-not-lent-without-max-lifetime
+  (let* ((conn (list :shared))
+         (pool (make-pool :connector (constantly conn)
+                          :disconnector (lambda (c)
+                                          (declare (ignore c))
+                                          (error "close failed"))
+                          :max-open-count 2
+                          :max-idle-count 0
+                          :timeout 0)))
+    (ok (eq (fetch pool) conn))
+    (ok (signals (putback conn pool) 'error))
+    (ok (signals (fetch pool) 'anypool::resource-already-in-pool)
+        "A quarantined resource cannot be handed to another borrower")
+    (ok (= (length (pool-failed-disconnections pool)) 1))
+    (ok (= (pool-open-count pool) 1))))
+
+(deftest shared-object-is-closed-only-after-the-last-slot-retires
+  (dolist (conn (list nil (list :shared)))
+    (let* ((attempts 0)
+           (pool (make-pool :connector (constantly conn)
+                            :ping (constantly nil)
+                            :disconnector (lambda (c)
+                                            (declare (ignore c))
+                                            (incf attempts)
+                                            (error "close failed"))
+                            :max-open-count 2
+                            :max-idle-count 1
+                            :timeout 0)))
+      (fetch pool)
+      (fetch pool)
+      (putback conn pool)
+      (ignore-errors (putback conn pool))
+      (ok (= attempts 0) "The shared object is still owned by the idle slot")
+      (ok (null (pool-failed-disconnections pool)))
+      (ok (signals (fetch pool) 'error) "The final reference attempts the close")
+      (ok (= attempts 1))
+      (ok (= (length (pool-failed-disconnections pool)) 1))
+      (ok (signals (fetch pool) 'anypool::resource-already-in-pool)))))
+
+(deftest shared-rejected-object-stays-open-for-the-other-borrower
+  (let* ((conn (list :shared))
+         (calls 0)
+         (closed '())
+         (pool (make-pool :connector (lambda ()
+                                       (case (incf calls)
+                                         ((1 2) conn)
+                                         (otherwise (list :replacement))))
+                          :ping (constantly nil)
+                          :disconnector (lambda (c) (push c closed))
+                          :max-open-count 2
+                          :max-idle-count 1
+                          :timeout 0)))
+    (let ((borrowed (fetch pool))
+          (other (fetch pool)))
+      (putback other pool)
+      (let ((replacement (fetch pool)))
+        (ng (eq replacement borrowed))
+        (ok (null closed) "A failed ping does not close a resource still borrowed elsewhere")
+        (putback borrowed pool)
+        (ok (equal closed (list conn)) "The invalid resource closes after its last return")
+        (putback replacement pool)))))
+
+(deftest rejected-idle-alias-is-never-lent-again
+  (let* ((conn (list :shared))
+         (calls 0)
+         (closed '())
+         (pool (make-pool :connector (lambda ()
+                                       (case (incf calls)
+                                         ((1 2) conn)
+                                         (otherwise (list :replacement))))
+                          :ping (constantly nil)
+                          :disconnector (lambda (c) (push c closed))
+                          :max-open-count 3
+                          :max-idle-count 2
+                          :timeout 0)))
+    (let ((a (fetch pool))
+          (b (fetch pool)))
+      (putback a pool)
+      (putback b pool)
+      (let ((replacement (fetch pool)))
+        (ng (eq replacement conn))
+        (ok (= (count conn closed :test #'eq) 1)
+            "Both idle aliases are retired before the physical close")
+        (putback replacement pool)))))
+
+#+sbcl
+(deftest idle-timeout-closes-a-shared-object-only-after-its-last-slot
+  (let* ((conn (list :shared))
+         (closed (bt2:make-semaphore))
+         (attempts 0)
+         (pool (make-pool :connector (constantly conn)
+                          :disconnector (lambda (c)
+                                          (declare (ignore c))
+                                          (incf attempts)
+                                          (bt2:signal-semaphore closed))
+                          :max-open-count 2
+                          :max-idle-count 2
+                          :idle-timeout 20)))
+    (let ((a (fetch pool))
+          (b (fetch pool)))
+      (putback a pool)
+      (putback b pool))
+    (ok (bt2:wait-on-semaphore closed :timeout 5))
+    (ok (loop repeat 500
+              thereis (zerop (pool-open-count pool))
+              do (sleep 0.01)))
+    (ok (= attempts 1) "The shared resource is disconnected only once")))
+
+(deftest failed-disconnection-cannot-be-retried-by-putback
+  (let* ((attempts 0)
+         (pool (make-pool :connector (lambda () (list :connection))
+                          :disconnector (lambda (conn)
+                                          (declare (ignore conn))
+                                          (incf attempts)
+                                          (error "close failed"))
+                          :max-open-count 1
+                          :max-idle-count 0
+                          :timeout 0))
+         (conn (fetch pool)))
+    (ok (signals (putback conn pool) 'error))
+    (ok (signals (putback conn pool) 'error))
+    (ok (= attempts 1) "A failed close is not retried implicitly")
+    (ok (= (length (pool-failed-disconnections pool)) 1))
+    (ok (= (pool-open-count pool) 1))))
 
 (define-condition injected-failure (error) ())
 
@@ -889,6 +1352,7 @@ in the pool can swallow it."
            (now 0)
            (interrupts 0)
            (stop nil)
+           (cleaner-stop nil)
            (pool (apply #'make-pool
                         :connector (lambda ()
                                      (when (zerop (random 20))
@@ -899,10 +1363,11 @@ in the pool can swallow it."
                                          (incf live))
                                        conn))
                         :disconnector (lambda (conn)
-                                        (bt2:with-lock-held (stat-lock)
-                                          (decf live)
-                                          (when (> (incf (cdr conn)) 1)
-                                            (incf double-disconnects))))
+                                        (without-interrupts*
+                                          (bt2:with-lock-held (stat-lock)
+                                            (decf live)
+                                            (when (> (incf (cdr conn)) 1)
+                                              (incf double-disconnects)))))
                         :ping (lambda (conn)
                                 (declare (ignore conn))
                                 (case (random 50)
@@ -917,7 +1382,22 @@ in the pool can swallow it."
                         args)))
       (setf (pool-clock pool)
             (lambda () (bt2:with-lock-held (clock-lock) (incf now))))
-      (let* ((workers
+      (let* ((cleaner
+               (bt2:make-thread
+                (lambda ()
+                  (loop
+                    (dolist (record (pool-failed-disconnections pool))
+                      (let ((conn (failed-disconnection-connection record)))
+                        ;; This test can inspect its fake resource to know whether the interrupted
+                        ;; disconnector closed it; real callers must verify closure themselves.
+                        (bt2:with-lock-held (stat-lock)
+                          (when (zerop (cdr conn))
+                            (incf (cdr conn))
+                            (decf live)))
+                        (acknowledge-failed-disconnection pool record)))
+                    (when cleaner-stop (return))
+                    (sleep 0.001)))))
+             (workers
                (loop repeat 8
                      collect (bt2:make-thread
                               (lambda ()
@@ -947,7 +1427,8 @@ in the pool can swallow it."
                                                                       (bt2:thread-yield)))
                                                                (bt2:with-lock-held (stat-lock)
                                                                  (remhash conn lent))))))
-                                                     ((or interrupted too-many-open-connection injected-failure) ()
+                                                     ((or interrupted too-many-open-connection injected-failure
+                                                          connection-expired-before-use) ()
                                                        nil)
                                                      (error (e)
                                                        (bt2:with-lock-held (stat-lock)
@@ -970,9 +1451,11 @@ in the pool can swallow it."
         (setf stop t)
         (ok finished "Every worker finished")
         (ok (join-within chaos 10) "The chaos thread stopped")
+        (when (and finished (getf args :idle-timeout))
+          (sleep 0.2))
+        (setf cleaner-stop t)
+        (ok (join-within cleaner 10) "The failure-record cleaner stopped")
         (when finished
-          (when (getf args :idle-timeout)
-            (sleep 0.2))
           (ok (plusp interrupts) "Interrupts were actually sent")
           (ok (null unexpected-errors) (format nil "No unexpected errors: ~S" unexpected-errors))
           (ok (= double-lends 0) "No connection lent to two borrowers at once")
@@ -981,7 +1464,6 @@ in the pool can swallow it."
           (ok (= (pool-active-count pool) 0) "Every slot came back")
           (ok (= (pool-open-count pool) (pool-idle-count pool)))
           (ok (= (hash-table-count (pool-created-at-table pool)) (pool-open-count pool)))
-          ;; Interrupted right after the connector returns or inside the disconnector, a physical
-          ;; connection can be left open; each such leak takes one interrupt.
+          ;; A connector interrupted before returning must clean up its own physical resource.
           (ok (<= (pool-open-count pool) live (+ (pool-open-count pool) interrupts))
               (format nil "live=~A open=~A interrupts=~A" live (pool-open-count pool) interrupts)))))))

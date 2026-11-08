@@ -76,9 +76,9 @@ This software is still ALPHA quality. The APIs will be likely to change.
 ### [Constructor] make-pool (&key name connector disconnector ping max-open-count max-idle-count timeout idle-timeout max-lifetime)
 
 - `:name`: The name of a new pool. This is used to print the object.
-- `:connector` (Required): A function to make and return a new connection object. It takes no arguments. It must return a non-`nil` object. It runs without the pool lock and may be called from several threads at once, so it must be thread-safe.
-- `:disconnector`: A function to disconnect a given object. It takes a single argument which is made by `:connector`.
-- `:ping`: A function to check if the given object is still available. It takes a single argument. It runs without the pool lock and may be called from several threads at once, each on a different object. If it returns `nil`, the object is disconnected and `fetch` tries another one. If it signals an error, the object is disconnected, and then the error propagates from `fetch`. In both cases any error from `:disconnector` is ignored.
+- `:connector` (Required): A function to make and return a new connection object. It takes no arguments and may return `nil` as a resource. It runs without the pool lock and may be called from several threads at once, so it must be thread-safe.
+- `:disconnector`: A function to disconnect a given object. It takes a single argument returned by `:connector`. It runs without the pool lock and may be called concurrently. See [failed disconnections](#failed-disconnections) for error handling.
+- `:ping`: A function to check if the given object is still available. It takes a single argument. It runs without the pool lock and may be called from several threads at once. If it returns `nil`, the object is disconnected and `fetch` tries another one. If it signals an error, the pool attempts to disconnect the object and propagates the original error. A failed disconnect is recorded even when the original ping error takes precedence.
 - `:max-open-count`: The maximum number of concurrently open connections. The default is `4` and can be configured with `*default-max-open-count*`. If `nil`, allows unlimited connections (never blocks or errors).
 - `:max-idle-count`: The maximum number of idle/pooled connections. The default is `2` and can be configured with `*default-max-idle-count*`.
 - `:timeout`: The milliseconds to wait in `fetch` when the number of open connection reached to the maximum. A slot in which another `fetch` is still connecting or pinging counts as open, so this also bounds how long `fetch` waits behind a slow connect. It bounds each wait, not the whole call: if another thread takes the slot that woke `fetch`, it waits again. If `nil`, it waits forever. The default is `nil`.
@@ -121,11 +121,11 @@ Return the `:max-lifetime` given to `make-pool`, or `nil` if it is disabled. It 
 
 ### [Accessor] pool-open-count (pool)
 
-Return the number of currently open connections. The count is the sum of `pool-active-count` and `pool-idle-count`.
+Return the number of occupied or reserved slots. The count is the sum of `pool-active-count` and `pool-idle-count`; it includes connections being opened or closed and failed disconnections awaiting acknowledgment.
 
 ### [Accessor] pool-active-count (pool)
 
-Return the number of currently in use connections.
+Return the number of slots in use or reserved for a connection being opened, checked, closed, or awaiting acknowledgment of a failed disconnect.
 
 ### [Accessor] pool-idle-count (pool)
 
@@ -145,14 +145,38 @@ No open resource available and can't open due to the `max-open-count`, this func
 
 Send an in-use connection back to `pool` to make it reusable by other threads. If the number of idle connections is reached to `pool-max-idle-count`, the connection will be disconnected immediately.
 
+### Lack middleware
+
+The `anypool/middleware` system accepts the same pool constructor options, including `:max-lifetime`. Alternatively, pass an existing pool as `:pool`, without other pool constructor options. Keeping the pool reference lets the caller inspect and acknowledge failed disconnections even when Lack constructs the middleware stack. `:var` can be used with either form.
+
+```lisp
+(funcall anypool/middleware:*lack-middleware-anypool* app :pool *connection-pool*)
+```
+
+### [Function] pool-failed-disconnections (pool)
+
+Return a snapshot of failed-disconnection records. Each record has read-only accessors `failed-disconnection-connection` and `failed-disconnection-condition`; the condition is `nil` if the disconnect exited without signalling an error. These records continue to occupy slots.
+
+### [Function] acknowledge-failed-disconnection (pool record)
+
+After verifying that the record's physical connection is closed, release its reserved slot. Return true if the record belonged to the pool and was still awaiting acknowledgment; return `nil` for a stale record or a record from another pool. This function does not call the disconnector.
+
+## Failed disconnections
+
+If a disconnector signals an error or exits before it completes, the pool cannot know whether the resource was actually closed. It retains the resource and its slot in a failed-disconnection record rather than automatically retrying or opening a replacement. A direct disconnect error propagates to the caller. If disconnecting during cleanup after another error also fails, the original error propagates and the disconnect failure is recorded. An idle-timer disconnect has no caller, so inspect `pool-failed-disconnections` to find failures there.
+
+An operator can inspect each record, close the resource out of band if necessary, and call `acknowledge-failed-disconnection` only after verifying it is closed. A failed slot remains reserved until acknowledgment; waiters can time out or continue to wait. Retrying blindly can close an already-closed resource twice. `with-connection` preserves an error or other non-local exit from its body if cleanup signals an error; the failed disconnect remains recorded.
+
+When `:max-lifetime` is disabled and a connector returns the same object for several slots, the pool disconnects it only after its last slot is retired. If a ping rejects a shared object, its remaining idle aliases are retired rather than lent; aliases already borrowed are retired on return.
+
 ## Interrupts
 
 On SBCL, `fetch`, `putback` and `with-connection` keep their slot accounting correct when the thread is interrupted, for example by `sb-ext:with-timeout` or `interrupt-thread`. The connector, the ping, the disconnector and the body of `with-connection` can still be interrupted.
 
 - Use `with-connection` where you can. It defers interrupts from the moment `fetch` returns until the connection is bound, and while it is put back. If you call `fetch` and `putback` directly, an interrupt between `fetch` returning and your code taking the connection loses the connection and its slot.
 - If `conn` in `with-connection` names a special variable, it is bound to `nil` while `fetch` runs.
-- An interrupt right after `:connector` returns, before the pool records the connection, frees the slot but leaves that physical connection open. An interrupt while a retired connection is being disconnected can leave the connection open as well. The pool's counts stay correct in both cases.
-- Where the pool ignores errors from `:disconnector` (after a failed ping, for an expired connection), it ignores every `error` signalled during the disconnect, including one that an interrupt function signals there. Conditions that are not errors, such as `sb-ext:timeout` from `sb-ext:with-timeout`, and non-local exits such as `throw` still take effect.
+- If the connector is interrupted before returning an object, it must clean up any resources it has already opened. Once the pool has received the object, it attempts to disconnect it if `fetch` exits before lending it.
+- An interrupt during disconnection leaves a failed-disconnection record and retains the slot. Non-local exits and conditions such as `sb-ext:timeout` still take effect.
 - On other implementations there is no protection against interrupts.
 
 ## max-lifetime
@@ -161,11 +185,11 @@ On SBCL, `fetch`, `putback` and `with-connection` keep their slot accounting cor
 
 What it guarantees:
 
-- `fetch` never lends out a connection once `max-lifetime` has passed since `:connector` returned it. An idle connection is checked when `fetch` commits to lending it, which is after `:ping` returns. A new connection is lent at age zero: `fetch` hands it out right after recording its creation time, and no callback runs in between.
+- `fetch` checks a connection's age before lending it. An idle connection is checked again after `:ping` returns. If a new connection expires while waiting to be registered, it is retired and `fetch` signals `connection-expired-before-use`; it does not repeatedly connect forever when the configured lifetime is too short.
 - Using a connection does not extend its lifetime. The creation time is kept across `fetch` and `putback`.
 - A connection that expires while borrowed is not touched. It is disconnected when it is `putback`, and a thread waiting in `fetch` is woken to open a new one.
 - It works with `:ping nil` and with a `:ping` that always succeeds. An expired connection is dropped without calling `:ping`.
-- If `:disconnector` signals an error for an expired connection, the error is ignored, as for a connection whose ping failed. The connection is not reused either way.
+- If `:disconnector` fails for an expired connection, the connection is not reused and the failure remains recorded until it is acknowledged.
 
 What it does not do:
 

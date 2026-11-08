@@ -8,12 +8,20 @@
 (defparameter *connection* nil)
 
 (defparameter *lack-middleware-anypool*
-  (lambda (app &rest args &key (var '*connection*) connector disconnector ping max-open-count max-idle-count timeout idle-timeout)
-    (declare (ignore connector disconnector ping max-open-count max-idle-count timeout idle-timeout))
+  (lambda (app &rest args &key (var '*connection*) (pool nil pool-supplied-p)
+                               connector disconnector ping max-open-count max-idle-count
+                               timeout idle-timeout max-lifetime)
+    (declare (ignore connector disconnector ping max-open-count max-idle-count timeout idle-timeout max-lifetime))
     (remf args :var)
-    (let ((pool (apply #'anypool:make-pool args)))
+    (remf args :pool)
+    (let ((pool (if pool-supplied-p
+                    (progn
+                      (when args
+                        (error "Pool constructor options cannot be combined with :pool."))
+                      (check-type pool anypool:pool)
+                      pool)
+                    (apply #'anypool:make-pool args))))
       (lambda (env)
-        (let ((conn (anypool:fetch pool)))
+        (anypool:with-connection (conn pool)
           (progv (list var) (list conn)
-            (unwind-protect (funcall app env)
-              (anypool:putback conn pool))))))))
+            (funcall app env)))))))

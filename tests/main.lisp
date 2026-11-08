@@ -164,6 +164,10 @@ monotonic clock can read 499998us after (sleep 0.5).")
              (conn (fetch pool)))
         (putback conn pool)
         (ok (signals (fetch pool) 'ping-broken))
+        (ok (= (pool-open-count pool) 1))
+        (let ((record (first (pool-failed-disconnections pool))))
+          (ok record)
+          (when record (ok (acknowledge-failed-disconnection pool record))))
         (ok (= (pool-open-count pool) 0))))))
 
 #+sbcl
@@ -385,7 +389,7 @@ monotonic clock can read 499998us after (sleep 0.5).")
       (let ((result (bt2:join-thread waiter)))
         (ok (eq (first result) :ok))
         (ok (eql (second result) 2) "The waiter opens a new connection"))))
-  (testing "a failing disconnector still propagates, but the waiter is woken"
+  (testing "a failed disconnect retains capacity until it is acknowledged"
     (let* ((pool (make-pool :name "test pool"
                             :connector (let ((n 0)) (lambda () (incf n)))
                             :disconnector (lambda (conn)
@@ -396,6 +400,10 @@ monotonic clock can read 499998us after (sleep 0.5).")
            (conn (fetch pool))
            (waiter (start-waiting-fetch (lambda () (fetch pool)) (pool-lock pool))))
       (ok (signals (putback conn pool) 'simple-error))
+      (let ((record (first (pool-failed-disconnections pool))))
+        (ok record)
+        (when record
+          (ok (acknowledge-failed-disconnection pool record))))
       (let ((result (bt2:join-thread waiter)))
         (ok (eq (first result) :ok))
         (ok (eql (second result) 2)))
