@@ -31,6 +31,7 @@
            #:putback
            #:too-many-open-connection
            #:connection-expired-before-use
+           #:connection-identity-uncertain
            #:error-max-open-limit
            #:with-connection))
 
@@ -68,6 +69,13 @@ Must appear lexically inside WITHOUT-INTERRUPTS*."
       (values nil nil)
       (queue-peek queue)))
 
+(defstruct (opening (:constructor make-opening ()))
+  ;; Identities retired while this connector is in flight cannot be lent from its result.
+  (retired (make-hash-table :test 'eql) :read-only t)
+  (history-incomplete-p nil))
+
+(defconstant +opening-history-limit+ 4096)
+
 (defstruct (pool (:constructor nil))  ; Don't generate constructor for base struct
   name
   connector
@@ -93,6 +101,7 @@ Must appear lexically inside WITHOUT-INTERRUPTS*."
   ;; interrupted connector returned while another borrower already owns it.
   (managed-table (make-hash-table :test 'eql) :read-only t)
   (retiring-table (make-hash-table :test 'eql) :read-only t)
+  (openings nil)
   (failed-disconnection-records nil)
   (clock #'get-internal-real-time))
 
@@ -162,6 +171,13 @@ Must appear lexically inside WITHOUT-INTERRUPTS*."
   (:report (lambda (condition stream)
              (declare (ignore condition))
              (write-string "The new connection expired before it could be lent." stream))))
+
+(define-condition connection-identity-uncertain (anypool-error)
+  ((resource :initarg :resource))
+  (:report (lambda (condition stream)
+             (format stream "The identity of ~S cannot be verified after too many overlapping ~
+                             retirements; it must be checked before releasing its slot."
+                     (slot-value condition 'resource)))))
 
 (defun lifetime-limit (max-lifetime)
   "Return MAX-LIFETIME milliseconds times internal-time-units-per-second as an exact rational.
@@ -241,6 +257,45 @@ Comparing it with 1000 times the elapsed internal time decides expiry without ro
     (error 'resource-already-in-pool :resource conn))
   (incf (gethash conn (pool-managed-table pool) 0)))
 
+(defun remember-retired (opening conn)
+  "With the pool lock held, remember CONN or mark the bounded history as incomplete."
+  (let ((retired (opening-retired opening)))
+    (unless (or (opening-history-incomplete-p opening) (gethash conn retired))
+      (if (< (hash-table-count retired) +opening-history-limit+)
+          (setf (gethash conn retired) t)
+          (setf (opening-history-incomplete-p opening) t)))))
+
+(defun begin-opening (pool)
+  "With the pool lock held, track identities already being retired during a connector call."
+  (let ((opening (make-opening)))
+    (maphash (lambda (conn state)
+               (when (member state '(:closing :failed))
+                 (remember-retired opening conn)))
+             (pool-retiring-table pool))
+    (push opening (pool-openings pool))
+    opening))
+
+(defun finish-opening (pool opening)
+  "With the pool lock held, stop tracking an opening whose result was handled."
+  (setf (pool-openings pool) (delete opening (pool-openings pool) :test #'eq)))
+
+(defun mark-openings-retired (pool conn)
+  "With the pool lock held, prevent in-flight connectors from lending CONN."
+  (dolist (opening (pool-openings pool))
+    (remember-retired opening conn)))
+
+(defun quarantine-uncertain (pool conn created-at)
+  "With the pool lock held, retain an unclassifiable resource and its reserved slot."
+  (when (pool-max-lifetime pool)
+    (register-created-at pool conn created-at))
+  (register-managed pool conn)
+  ;; An operator may close the resource before acknowledging the record.
+  (mark-openings-retired pool conn)
+  (setf (gethash conn (pool-retiring-table pool)) :failed)
+  (push (%make-failed-disconnection
+         conn (make-condition 'connection-identity-uncertain :resource conn))
+        (pool-failed-disconnection-records pool)))
+
 (defun prepare-retirement (pool conn release-slot-p invalidate-shared-p)
   "With the pool lock held, drop a shared slot or claim the last reference for closing.
 An invalid shared identity is never lent again, but is closed only after its last slot retires."
@@ -258,6 +313,9 @@ An invalid shared identity is never lent again, but is closed only after its las
          (decf (pool-active-count pool)))
        :released)
       (t
+       ;; An in-flight connector can have returned CONN without yet registering it. Mark its
+       ;; result unsafe before closing, including if the close finishes before it takes the lock.
+       (mark-openings-retired pool conn)
        (setf (gethash conn retiring) :closing)
        :close))))
 
@@ -371,6 +429,7 @@ they work in is counted as active meanwhile, so the pool never opens more than m
         (owned nil)                     ; a connection only this call holds
         (owned-p nil)
         (registered-p nil)
+        (opening nil)
         (lent nil)
         (lent-p nil))
     (without-interrupts*
@@ -407,7 +466,8 @@ they work in is counted as active meanwhile, so the pool never opens more than m
                               (unless held
                                 (incf (pool-active-count pool))
                                 (setf held t))
-                              (setf action :open)))))
+                              (setf opening (begin-opening pool)
+                                    action :open)))))
                        (when action
                          (return))
                        (unless (wait-for-slot pool)
@@ -457,12 +517,37 @@ they work in is counted as active meanwhile, so the pool never opens more than m
                               owned-p t)
                         (when (pool-max-lifetime pool)
                           (setf created-at (funcall (pool-clock pool)))))
-                      (bt2:with-lock-held (lock)
-                        (without-interrupts*
-                          (when (pool-max-lifetime pool)
-                            (register-created-at pool owned created-at))
-                          (register-managed pool owned)
-                          (setf registered-p t)))
+                      (let ((rejection nil))
+                        (bt2:with-lock-held (lock)
+                          (without-interrupts*
+                            (cond
+                              ((or (gethash owned (opening-retired opening))
+                                   (gethash owned (pool-retiring-table pool))
+                                   (and (pool-max-lifetime pool)
+                                        (nth-value 1 (gethash owned (pool-created-at-table pool)))))
+                               (setf rejection :retired))
+                              ((opening-history-incomplete-p opening)
+                               (if (nth-value 1 (gethash owned (pool-managed-table pool)))
+                                   (setf rejection :retired)
+                                   (progn
+                                     (finish-opening pool opening)
+                                     (setf opening nil)
+                                     (quarantine-uncertain pool owned created-at)
+                                     (setf owned-p nil
+                                           held nil
+                                           rejection :uncertain))))
+                              (t
+                               (when (pool-max-lifetime pool)
+                                 (register-created-at pool owned created-at))
+                               (register-managed pool owned)
+                               (setf registered-p t)
+                               (finish-opening pool opening)
+                               (setf opening nil)))))
+                        ;; Error handlers may inspect the pool, so signal after releasing its lock.
+                        (ecase rejection
+                          ((nil) nil)
+                          (:retired (error 'resource-already-in-pool :resource owned))
+                          (:uncertain (error 'connection-identity-uncertain :resource owned))))
                       (when (expired-at-p pool created-at)
                         (error 'connection-expired-before-use))
                       (return))))))
@@ -479,21 +564,35 @@ they work in is counted as active meanwhile, so the pool never opens more than m
                (when owned-p
                  (let ((conn owned)
                        (already-managed-p nil)
+                       (uncertain-p nil)
                        (retirement nil))
                    (bt2:with-lock-held (lock)
                      ;; A connector can return an object already lent elsewhere. An interrupt or
                      ;; duplicate-registration error must not disconnect that other borrower's object.
                      (setf already-managed-p
                            (and (not registered-p)
-                                (nth-value 1 (gethash conn (pool-managed-table pool)))))
-                     (unless (or registered-p already-managed-p)
-                       ;; The connector returned before registration. Claim its identity so a
-                       ;; failed cleanup remains visible and cannot be lent a second time.
-                       (when (pool-max-lifetime pool)
-                         (register-created-at pool conn 0))
-                       (register-managed pool conn))
+                                (or (and opening (gethash conn (opening-retired opening)))
+                                    (nth-value 1 (gethash conn (pool-managed-table pool))))))
+                     (setf uncertain-p
+                           (and (not registered-p) (not already-managed-p)
+                                opening (opening-history-incomplete-p opening)))
+                     (when opening
+                       (finish-opening pool opening)
+                       (setf opening nil))
                      (unless already-managed-p
-                       (setf retirement (prepare-retirement pool conn t t)))
+                       (if uncertain-p
+                           (progn
+                             ;; The result may already be closed or still belong to another
+                             ;; borrower; do not guess. Keep its slot for explicit recovery.
+                             (quarantine-uncertain pool conn 0)
+                             (setf retirement :uncertain))
+                           (progn
+                             (unless registered-p
+                               ;; Claim the identity so a failed cleanup remains visible.
+                               (when (pool-max-lifetime pool)
+                                 (register-created-at pool conn 0))
+                               (register-managed pool conn))
+                             (setf retirement (prepare-retirement pool conn t t)))))
                      (setf owned nil
                            owned-p nil
                            registered-p nil))
@@ -504,7 +603,12 @@ they work in is counted as active meanwhile, so the pool never opens more than m
                        (:close
                         (ignore-errors
                           (allow-with-interrupts* (retire-connection pool conn t))))
-                       (:already-retiring nil)))))
+                       (:already-retiring nil)
+                       (:uncertain nil)))))
+            (when opening
+              (bt2:with-lock-held (lock)
+                (finish-opening pool opening)
+                (setf opening nil)))
             (when held
               (release-slot pool))))))
     lent))

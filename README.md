@@ -76,7 +76,7 @@ This software is still ALPHA quality. The APIs will be likely to change.
 ### [Constructor] make-pool (&key name connector disconnector ping max-open-count max-idle-count timeout idle-timeout max-lifetime)
 
 - `:name`: The name of a new pool. This is used to print the object.
-- `:connector` (Required): A function to make and return a new connection object. It takes no arguments and may return `nil` as a resource. It runs without the pool lock and may be called from several threads at once, so it must be thread-safe.
+- `:connector` (Required): A function to make and return a new connection object. It takes no arguments and may return `nil` as a resource. It runs without the pool lock and may be called from several threads at once, so it must be thread-safe. Equal `eql` identities returned by overlapping calls must refer to the same physical resource; do not reuse an identity for a different resource while calls overlap.
 - `:disconnector`: A function to disconnect a given object. It takes a single argument returned by `:connector`. It runs without the pool lock and may be called concurrently. See [failed disconnections](#failed-disconnections) for error handling.
 - `:ping`: A function to check if the given object is still available. It takes a single argument. It runs without the pool lock and may be called from several threads at once. If it returns `nil`, the object is disconnected and `fetch` tries another one. If it signals an error, the pool attempts to disconnect the object and propagates the original error. A failed disconnect is recorded even when the original ping error takes precedence.
 - `:max-open-count`: The maximum number of concurrently open connections. The default is `4` and can be configured with `*default-max-open-count*`. If `nil`, allows unlimited connections (never blocks or errors).
@@ -155,11 +155,11 @@ The `anypool/middleware` system accepts the same pool constructor options, inclu
 
 ### [Function] pool-failed-disconnections (pool)
 
-Return a snapshot of failed-disconnection records. Each record has read-only accessors `failed-disconnection-connection` and `failed-disconnection-condition`; the condition is `nil` if the disconnect exited without signalling an error. These records continue to occupy slots.
+Return a snapshot of records for failed disconnections and connections whose identity could not be verified. Each record has read-only accessors `failed-disconnection-connection` and `failed-disconnection-condition`; the condition is `nil` if the disconnect exited without signalling an error. These records continue to occupy slots.
 
 ### [Function] acknowledge-failed-disconnection (pool record)
 
-After verifying that the record's physical connection is closed, release its reserved slot. Return true if the record belonged to the pool and was still awaiting acknowledgment; return `nil` for a stale record or a record from another pool. This function does not call the disconnector.
+After verifying that the record's physical connection is closed and not in use by another borrower, release its reserved slot. Return true if the record belonged to the pool and was still awaiting acknowledgment; return `nil` for a stale record or a record from another pool. This function does not call the disconnector.
 
 ## Failed disconnections
 
@@ -168,6 +168,8 @@ If a disconnector signals an error or exits before it completes, the pool cannot
 An operator can inspect each record, close the resource out of band if necessary, and call `acknowledge-failed-disconnection` only after verifying it is closed. A failed slot remains reserved until acknowledgment; waiters can time out or continue to wait. Retrying blindly can close an already-closed resource twice. `with-connection` preserves an error or other non-local exit from its body if cleanup signals an error; the failed disconnect remains recorded.
 
 When `:max-lifetime` is disabled and a connector returns the same object for several slots, the pool disconnects it only after its last slot is retired. If a ping rejects a shared object, its remaining idle aliases are retired rather than lent; aliases already borrowed are retired on return.
+
+A connector can overlap the retirement of another connection with the same identity. In that case the pool rejects the returned object rather than lend or disconnect a resource that may already be closed. To bound memory, each in-progress connector tracks at most 4,096 distinct retired identities. If it overlaps more retirements and returns an identity that cannot be classified, `fetch` signals `connection-identity-uncertain` and retains the object and its slot in a failed-disconnection record. The pool has not attempted a disconnect in this case. The resource may be new, already closed, or shared, so an operator must verify its identity and closure before acknowledgment. A long-running connector during heavy connection churn can therefore reduce available pool capacity until this recovery is performed.
 
 ## Interrupts
 
